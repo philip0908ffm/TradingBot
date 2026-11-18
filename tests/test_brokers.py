@@ -275,6 +275,9 @@ def test_alpaca_bars_and_timeframe():
     assert req.timeframe.amount_value == 1 and req.timeframe.unit_value.value == "Day"
     assert req.feed.value == "iex"
     assert len(df) == 10 and list(df.columns) == OHLCV_COLUMNS and str(df.index.tz) == "UTC"
+    recent = datetime.now(timezone.utc) - timedelta(days=2)
+    b.data_client.get_stock_bars.return_value = SimpleNamespace(
+        data={"AAPL": [_bar(recent + timedelta(hours=4 * i), 100 + i) for i in range(6)]})
     df2 = b.fetch_ohlcv("AAPL", "4h", limit=3)
     req2 = b.data_client.get_stock_bars.call_args.args[0]
     assert req2.timeframe.amount_value == 4 and len(df2) == 3
@@ -350,13 +353,16 @@ def _yf_frame(index, tz="America/New_York"):
 class FakeTicker:
     frames: list = []
     calls: list = []
+    default: pd.DataFrame | None = None
 
     def __init__(self, symbol):
         self.symbol = symbol
 
     def history(self, **kw):
         FakeTicker.calls.append(kw)
-        return FakeTicker.frames.pop(0) if FakeTicker.frames else pd.DataFrame()
+        if FakeTicker.frames:
+            return FakeTicker.frames.pop(0)
+        return FakeTicker.default if FakeTicker.default is not None else pd.DataFrame()
 
     @property
     def fast_info(self):
@@ -365,7 +371,7 @@ class FakeTicker:
 
 @pytest.fixture
 def fake_yf(monkeypatch):
-    FakeTicker.frames, FakeTicker.calls = [], []
+    FakeTicker.frames, FakeTicker.calls, FakeTicker.default = [], [], None
     monkeypatch.setattr(yahoo_broker.yf, "Ticker", FakeTicker)
     return FakeTicker
 
@@ -381,9 +387,11 @@ def test_yahoo_daily_normalization(fake_yf):
 
 def test_yahoo_4h_resample_and_1w_interval(fake_yf):
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    idx = pd.date_range(now - timedelta(hours=23), periods=24, freq="h", tz="UTC")
+    base = now.replace(hour=now.hour - now.hour % 4) - timedelta(days=2)
+    idx = pd.date_range(base, periods=24, freq="h", tz="UTC")
     fake_yf.frames = [_yf_frame(idx)]
-    df = YahooBroker().fetch_ohlcv("BTC-USD", "4h", start=now - timedelta(days=1), end=now)
+    df = YahooBroker().fetch_ohlcv("BTC-USD", "4h", start=base, end=base + timedelta(hours=23))
+    assert len(df) == 6
     assert fake_yf.calls[0]["interval"] == "1h"
     assert (df.index.hour % 4 == 0).all()
     assert df["volume"].sum() == pytest.approx(24 * 1000)
@@ -398,6 +406,7 @@ def test_yahoo_interval_limits(fake_yf):
         YahooBroker().fetch_ohlcv("AAPL", "5m", start=now - timedelta(days=200),
                                   end=now - timedelta(days=100))
     # start clamped into the allowed window
+    fake_yf.default = _yf_frame(pd.date_range(now - timedelta(hours=5), periods=3, freq="h"), tz="UTC")
     YahooBroker().fetch_ohlcv("AAPL", "1h", start=now - timedelta(days=1000), end=now)
     assert fake_yf.calls[-1]["start"] >= now - timedelta(days=730)
     # 1m requests are chunked in 7-day windows
