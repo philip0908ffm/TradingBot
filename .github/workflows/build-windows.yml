@@ -7,6 +7,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:  # a newer push cancels the still-running build of an older one
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write  # needed to attach the exe to a GitHub Release on tags
 
