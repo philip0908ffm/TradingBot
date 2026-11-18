@@ -99,12 +99,14 @@ def required_indicators(strategy: Strategy) -> list[tuple[str, dict]]:
 
 def warmup_bars(strategy: Strategy) -> int:
     """Heuristic number of history bars needed before signals are reliable:
-    3 x the largest integer parameter of any used indicator + the largest offset (min 50)."""
+    3 x the largest integer (window) parameter of any used indicator + the largest offset
+    (min 50)."""
     largest = 0
     for key, params in required_indicators(strategy):
         spec = registry.get(key)
         for prm in spec.params:
-            if prm.type == "int":
+            # only window-like params (skip e.g. hv.periods_per_year)
+            if prm.type == "int" and prm.max <= 1000:
                 largest = max(largest, int(params[prm.name]))
     max_offset = max((max(int(op.offset or 0), 0) for op in _iter_operands(strategy)), default=0)
     return max(MIN_WARMUP, 3 * largest + max_offset + 1)
