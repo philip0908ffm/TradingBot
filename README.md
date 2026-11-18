@@ -29,6 +29,15 @@ Backtest, TEST und LIVE verwenden **denselben Code** für Signale, Positionsgrö
 - **Töne** für Kauf, Verkauf mit Gewinn/Verlust, Take-Profit, Stop-Loss und Fehler, einzeln abschaltbar.
 - **Sicherheit:** API-Schlüssel verschlüsselt gespeichert, LIVE-Hauptschalter, harte Obergrenze pro Order, tägliches Verlustlimit (Notbremse).
 
+## Screenshots
+
+| | |
+|---|---|
+| **Charts** mit Indikatoren und Bot-Trades ![Charts](docs/screenshots/charts.png) | **TradingView-Widget** ![TradingView](docs/screenshots/tradingview.png) |
+| **Strategie-Editor** ![Strategien](docs/screenshots/strategies.png) | **Backtest** ![Backtest](docs/screenshots/backtest.png) |
+| **Optimierung** ![Optimierung](docs/screenshots/backtest-optimizer.png) | **Test-Trading** ![Test-Trading](docs/screenshots/test-trading.png) |
+| **Wallet** ![Wallet](docs/screenshots/wallet.png) | **Einstellungen** ![Einstellungen](docs/screenshots/settings.png) |
+
 ## Installation (Windows)
 
 ### Variante A: fertige .exe (kein Python nötig)
