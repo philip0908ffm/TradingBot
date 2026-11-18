@@ -15,6 +15,13 @@ export default {
     this.chart = createChart(this.$el, this.chartOptions());
     this.resizeObserver = new ResizeObserver(() => {
       this.chart.applyOptions({ width: this.$el.clientWidth, height: this.$el.clientHeight });
+      this.sizePanes();
+      // data pushed before the element had its final size: render it now
+      if (this.pending && this.$el.clientHeight > 0) {
+        const p = this.pending;
+        this.pending = null;
+        this.setData(p);
+      }
     });
     this.resizeObserver.observe(this.$el);
     if (this.payload) this.setData(this.payload);
@@ -54,6 +61,17 @@ export default {
         localization: { locale: "de-DE" },
       };
     },
+    // oscillator panes get their fixed height (scaled down if space is short), main pane the rest
+    sizePanes() {
+      const sub = this.paneHeights || [];
+      const ps = this.chart.panes();
+      if (ps.length < 2 || !sub.length) return;
+      const total = this.$el.clientHeight;
+      const subSum = sub.reduce((a, b) => a + b, 0);
+      const scale = subSum > total * 0.55 ? (total * 0.55) / subSum : 1;
+      sub.forEach((h, i) => ps[i + 1] && ps[i + 1].setHeight(Math.round(h * scale)));
+      ps[0].setHeight(Math.max(80, Math.round(total - subSum * scale)));
+    },
     clear() {
       for (const s of this.series) this.chart.removeSeries(s);
       this.series = [];
@@ -69,7 +87,10 @@ export default {
     },
     // payload: {candles, volume, overlays, panes, markers, price_lines, line, fit}
     setData(p) {
-      if (!this.chart) return;
+      if (!this.chart || this.$el.clientHeight === 0 || this.$el.clientWidth === 0) {
+        this.pending = p;  // not laid out yet (e.g. Tailwind classes pending) -> render on resize
+        return;
+      }
       const keepRange = p.keep_range ? this.chart.timeScale().getVisibleLogicalRange() : null;
       this.clear();
       let main = null;
@@ -118,21 +139,9 @@ export default {
           first.createPriceLine({ price: lvl, color: "#6b7280", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false });
         }
       });
-      // size panes: oscillator panes fixed height, main pane takes the rest
-      const panes = this.chart.panes();
-      const total = this.$el.clientHeight;
-      const sub = (p.panes || []).map((x) => x.height || 120);
-      const subSum = sub.reduce((a, b) => a + b, 0);
-      if (panes.length > 1) {
-        const scale = subSum > total * 0.55 ? (total * 0.55) / subSum : 1;
-        const apply = () => {
-          const ps = this.chart.panes();
-          sub.forEach((h, i) => ps[i + 1] && ps[i + 1].setHeight(Math.round(h * scale)));
-          ps[0].setHeight(Math.max(120, Math.round(total - subSum * scale)));
-        };
-        apply();
-        requestAnimationFrame(() => requestAnimationFrame(apply));
-      }
+      this.paneHeights = (p.panes || []).map((x) => x.height || 120);
+      this.sizePanes();
+      requestAnimationFrame(() => requestAnimationFrame(() => this.sizePanes()));
       if (main && p.markers && p.markers.length) {
         this.markers = createSeriesMarkers(main, p.markers.slice().sort((a, b) => a.time - b.time));
       }

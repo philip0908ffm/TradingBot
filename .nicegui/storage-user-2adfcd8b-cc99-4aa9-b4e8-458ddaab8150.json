@@ -1,0 +1,1 @@
+{"backtest_form":{"strategy":"p:RSI-Rücksetzer im Aufwärtstrend","symbol":"BTC/USDT","broker":"binance","timeframe":null,"start":"2026-05-20","end":"2026-11-18","capital":10000.0,"override_costs":false}}

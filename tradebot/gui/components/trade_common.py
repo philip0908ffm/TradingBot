@@ -17,8 +17,9 @@ CSS = """
 .tb-tbl-wrap { width: 100%; overflow-x: auto; }
 .tb-tbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size: .86rem; }
 .tb-tbl th { text-align: left; font-weight: 600; font-size: .7rem; letter-spacing: .05em; text-transform: uppercase;
-             color: var(--tb-muted); padding: 8px 10px; border-bottom: 1px solid var(--tb-border); white-space: nowrap; }
-.tb-tbl td { padding: 9px 10px; border-bottom: 1px solid var(--tb-border); white-space: nowrap; vertical-align: middle; }
+             color: var(--tb-muted); padding: 8px 8px; border-bottom: 1px solid var(--tb-border); white-space: nowrap; vertical-align: bottom; }
+.tb-tbl th.wrap { white-space: normal; min-width: 90px; }
+.tb-tbl td { padding: 9px 8px; border-bottom: 1px solid var(--tb-border); white-space: nowrap; vertical-align: middle; }
 .tb-tbl tr:last-child td { border-bottom: none; }
 .tb-tbl tbody tr:hover td { background: var(--tb-surface-2); }
 .tb-tbl .r { text-align: right; }
