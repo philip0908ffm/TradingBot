@@ -452,8 +452,13 @@ class TradingBot:
             if pos is not None:
                 pairs.add((key, self._quote_for(key, pos.symbol)))
         total = 0.0
+        counted: set[tuple[int, str]] = set()  # same broker object + currency only once
         for key, quote in sorted(pairs):
             try:
+                broker = self.get_broker(key)
+                if not broker.info().supports_trading or (id(broker), quote) in counted:
+                    continue
+                counted.add((id(broker), quote))
                 bal = await self._balance(key)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Kontostand von %s nicht abrufbar: %s", key, exc)

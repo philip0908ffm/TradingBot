@@ -1,6 +1,5 @@
 """Engine features: order reconciliation, multiple positions per symbol, loss-streak pause,
 minimum profit, wallet / manual actions without running bot, external closes, event kinds."""
-import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 

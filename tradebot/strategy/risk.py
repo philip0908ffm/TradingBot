@@ -149,7 +149,7 @@ def can_open(
     if open_positions_symbol >= max(1, risk.max_positions_per_symbol):
         return False, f"Maximale Positionen für dieses Symbol ({risk.max_positions_per_symbol}) erreicht"
     if state.paused_indefinitely:
-        return False, "Symbol pausiert (Verlust-Serie) – manuelle Freigabe nötig"
+        return False, "Symbol pausiert (Verlust-Serie) – Freigabe manuell oder durch Neustart des Bots"
     if state.paused_until and now < state.paused_until:
         return False, f"Symbol pausiert (Verlust-Serie) bis {state.paused_until:%d.%m.%Y %H:%M} UTC"
     if risk.cooldown_seconds and state.last_buy_time and now < state.last_buy_time + timedelta(seconds=risk.cooldown_seconds):
@@ -279,6 +279,10 @@ def validate_risk(risk: RiskSettings) -> list[str]:
         err.append("Kauf-Preisfaktor muss zwischen 1,0 und 1,05 liegen (sonst wird die Order evtl. nie ausgeführt)")
     if risk.sell_order_type == "limit" and not 0.95 <= risk.sell_price_multiple <= 1.0:
         err.append("Verkaufs-Preisfaktor muss zwischen 0,95 und 1,0 liegen (sonst wird die Order evtl. nie ausgeführt)")
+    if risk.min_profit_pct < 0 or risk.min_profit_abs < 0:
+        err.append("Mindestgewinn darf nicht negativ sein")
+    if risk.trailing_activation_pct and not risk.trailing_stop_pct:
+        err.append("Trailing-Aktivierung ohne Trailing-Stop hat keine Wirkung – bitte Trailing-Stop setzen")
     if risk.fee_pct < 0 or risk.slippage_pct < 0:
         err.append("Gebühr und Slippage dürfen nicht negativ sein")
     if risk.max_holding_bars is not None and risk.max_holding_bars < 1:

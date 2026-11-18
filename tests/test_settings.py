@@ -89,3 +89,21 @@ def test_strategy_crud(tmp_path):
     assert store.list_strategies() == []
     with pytest.raises(KeyError):
         store.load_strategy("RSI Dip / Größe")
+
+
+def test_new_settings_fields_tolerant(tmp_path):
+    store = SettingsStore(tmp_path)
+    s = store.load()
+    assert s.order_timeout_seconds == 30 and s.sound_enabled is True and s.sound_volume == 0.6
+    assert s.sound_events == {k: True for k in
+                              ("buy", "sell_profit", "sell_loss", "stop_loss", "take_profit", "error")}
+    store.settings_path.write_text(json.dumps({
+        "sound_volume": 7, "sound_events": {"buy": False, "custom": 1}, "order_timeout_seconds": "12",
+    }))
+    s = store.load()
+    assert s.sound_volume == 1.0 and s.order_timeout_seconds == 12
+    assert s.sound_events["buy"] is False and s.sound_events["error"] is True
+    assert s.sound_events["custom"] is True
+    s.sound_enabled = False
+    store.save(s)
+    assert store.load().to_dict() == s.to_dict()
