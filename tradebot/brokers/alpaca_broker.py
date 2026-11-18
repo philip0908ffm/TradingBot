@@ -211,6 +211,7 @@ class AlpacaBroker(Broker):
         now = datetime.now(timezone.utc)
         keep_head = start is not None and end is None
         n = limit or _DEFAULT_CANDLES
+        auto_start = start is None
         if start is None:
             ref_end = end or now
             # Markets trade ~6.5h/day, 5 days/week: look back generously, cut with tail().
@@ -245,8 +246,10 @@ class AlpacaBroker(Broker):
             index=pd.DatetimeIndex([pd.Timestamp(b.timestamp) for b in bars]),
         )
         df = slice_range(normalize_ohlcv(df), start, end)
-        if limit or (end is None and start is not None and not keep_head):
-            df = df.head(n) if keep_head else df.tail(n)
+        if limit:
+            df = df.head(limit) if keep_head else df.tail(limit)
+        elif auto_start:
+            df = df.tail(n)
         return df
 
     def fetch_price(self, symbol: str) -> float:
