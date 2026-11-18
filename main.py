@@ -39,6 +39,12 @@ def selftest() -> int:
 
 
 def main() -> None:
+    # windowed .exe builds have no console: give print/logging somewhere to write
+    import os
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")  # noqa: SIM115
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")  # noqa: SIM115
     parser = argparse.ArgumentParser(description="TradingBot")
     parser.add_argument("--native", action="store_true", help="eigenes Fenster statt Browser")
     parser.add_argument("--browser", action="store_true", help="im Browser öffnen (auch in der .exe)")

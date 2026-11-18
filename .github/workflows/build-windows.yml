@@ -34,9 +34,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pyinstaller pywebview
       - name: Build single-file EXE
-        run: nicegui-pack --onefile --windowed --name TradingBot main.py
+        run: nicegui-pack --onefile --windowed --name TradingBot --add-data "tradebot/gui;tradebot/gui" main.py
       - name: Build folder version (starts faster, fewer antivirus false positives)
-        run: nicegui-pack --windowed --name TradingBot-folder --distpath dist-folder main.py
+        run: nicegui-pack --onedir --windowed --name TradingBot-folder --add-data "tradebot/gui;tradebot/gui" main.py
       - name: Smoke test (imports all modules, then exits)
         shell: pwsh
         run: |
@@ -44,7 +44,7 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "Selftest failed with exit code $($p.ExitCode)" }
       - name: Zip folder version
         shell: pwsh
-        run: Compress-Archive -Path dist-folder\TradingBot-folder\* -DestinationPath TradingBot-folder.zip
+        run: Compress-Archive -Path dist\TradingBot-folder\* -DestinationPath TradingBot-folder.zip
       - uses: actions/upload-artifact@v4
         with:
           name: TradingBot-windows
