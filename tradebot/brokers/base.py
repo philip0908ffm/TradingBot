@@ -29,6 +29,26 @@ class NotSupportedError(BrokerError):
     pass
 
 
+class InsufficientFundsError(BrokerError):
+    """Not enough cash / holdings for an order."""
+
+
+class InvalidOrderError(BrokerError):
+    """Order rejected for formal reasons (size, price, precision, minimum notional...)."""
+
+
+class BadSymbolError(BrokerError):
+    """Unknown or unsupported symbol."""
+
+
+class NetworkError(BrokerError):
+    """Connection problems, timeouts, exchange unavailable."""
+
+
+class RateLimitError(NetworkError):
+    """Too many requests; retry later."""
+
+
 @dataclass
 class CredentialField:
     """Describes one credential input for the Settings page."""
