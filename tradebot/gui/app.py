@@ -40,4 +40,7 @@ def run(native: bool = False, port: int = 8080, show: bool = True, reload: bool 
                   language="de", reconnect_timeout=10.0, storage_secret="tradebot-local")
     if native:
         kwargs.update(native=True, window_size=(1440, 920))
+        if port == 8080:  # default: let NiceGUI pick a free port for the desktop window
+            from nicegui import native as native_mod
+            kwargs["port"] = native_mod.find_open_port()
     ui.run(**kwargs)
