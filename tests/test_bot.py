@@ -460,10 +460,9 @@ def test_default_factory_paper_mode(store, sig, monkeypatch):
 def test_real_engine_smoke(store, monkeypatch):
     import numpy as np
 
-    from tradebot.strategy.presets import PRESETS, get_preset
+    from tradebot.strategy.presets import PRESETS
 
-    first = PRESETS[0] if isinstance(PRESETS, list) else next(iter(PRESETS))
-    st = first if isinstance(first, Strategy) else get_preset(first if isinstance(first, str) else first.name)
+    st = PRESETS[0]
     fake = FakeBroker()
     n = 400
     tf = bot_mod.TIMEFRAMES[st.timeframe]

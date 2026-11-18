@@ -338,15 +338,23 @@ class TradingBot:
             self._balance_cache[broker_key] = dict(await asyncio.to_thread(broker.fetch_balance))
         return self._balance_cache[broker_key]
 
+    def _paper(self):
+        """The shared PaperAccount when the default TEST-mode factory is used, else None."""
+        if self.mode == TradingMode.TEST and self._uses_default_factory:
+            return self._get_paper_account()
+        return None
+
     async def _cash_for(self, broker_key: str, symbol: str) -> float:
-        if self._paper_account is not None:
-            return float(self._paper_account.cash)
+        acc = self._paper()
+        if acc is not None:
+            return float(acc.cash)
         bal = await self._balance(broker_key)
         return float(bal.get(self._quote_for(broker_key, symbol), 0.0) or 0.0)
 
     async def _total_cash(self) -> float:
-        if self._paper_account is not None:
-            return float(self._paper_account.cash)
+        acc = self._paper()
+        if acc is not None:
+            return float(acc.cash)
         pairs: set[tuple[str, str]] = set()
         for w in self.watchlist:
             if w.enabled:
