@@ -115,6 +115,7 @@ class AccountCard:
 class MarketCard:
     def __init__(self, item: WatchItem, broker_label: str) -> None:
         self.item = item
+        self.has_data = False
         q = urlencode({"symbol": item.symbol, "broker": item.broker})
         with card("gap-2 tb-hover p-4").style("padding:16px"):
             with ui.row().classes("w-full items-start justify-between no-wrap"):
@@ -149,9 +150,8 @@ class MarketCard:
     def update(self, snap: dict | None, error: str | None) -> None:
         self._loaded()
         if snap is None:
-            if self.price.text:  # keep last good values, just mark as stale
-                self.sub.set_text("Aktualisierung fehlgeschlagen")
-                self.sub.tooltip(error or "")
+            if self.has_data:  # keep last good values, just mark as stale
+                self.sub.set_text(f"Aktualisierung fehlgeschlagen: {error or 'unbekannter Fehler'}")
                 return
             self.price.set_text("–")
             self.change.set_text("keine Daten")
@@ -162,6 +162,7 @@ class MarketCard:
                 '<span class="material-icons" style="font-size:16px;margin-right:6px">cloud_off</span>'
                 "Daten nicht verfügbar</div>")
             return
+        self.has_data = True
         ch = snap["change_pct"]
         self.price.set_text(fmt_price(snap["price"]))
         self.change.set_text(("▲ " if (ch or 0) >= 0 else "▼ ") + fmt_pct(ch))

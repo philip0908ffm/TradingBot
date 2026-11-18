@@ -1,1 +1,0 @@
-{"charts":{"symbol":"BTC/USDT","broker":"binance","timeframe":"1h","candles":500,"volume":true,"auto":false,"indicators":[{"key":"ema","params":{"period":50}},{"key":"rsi","params":{"period":14}},{"key":"bbands","params":{"period":20,"std":2.0}}]}}

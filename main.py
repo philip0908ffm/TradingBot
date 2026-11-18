@@ -65,6 +65,10 @@ def main() -> None:
             print("pywebview nicht installiert – starte im Browser.")
             native = False
 
+    # keep NiceGUI's per-browser storage next to the other app data, not in the working dir
+    from tradebot.core.settings import default_home
+    os.environ.setdefault("NICEGUI_STORAGE_PATH", str(default_home() / "gui-storage"))
+
     from tradebot.gui.app import run
     run(native=native, port=args.port, show=not args.no_show)
 

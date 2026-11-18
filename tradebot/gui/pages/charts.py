@@ -129,7 +129,7 @@ async def page(symbol: str | None = None, broker: str | None = None) -> None:
                     "height: calc(100vh - 395px); min-height: 440px; border-top: 1px solid var(--tb-border)"):
                 chart = TVChart(theme="dark" if is_dark() else "light").classes("w-full h-full")
                 with ui.column().classes("absolute inset-0 items-center justify-center gap-2").style(
-                        "pointer-events:none") as msg_box:
+                        "pointer-events:none; z-index:10; background: color-mix(in srgb, var(--tb-surface) 82%, transparent)") as msg_box:
                     msg_icon = ui.icon("cloud_off", size="38px").classes("tb-muted")
                     msg = ui.label("").classes("text-sm tb-muted text-center max-w-[460px]")
                 msg_box.visible = False
