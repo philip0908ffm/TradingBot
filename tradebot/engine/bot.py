@@ -195,7 +195,8 @@ def reset_paper_state(store: SettingsStore, starting_cash: float) -> None:
     try:
         from tradebot.brokers.paper import PaperAccount
 
-        PaperAccount(paper_account_path(store), float(starting_cash)).reset(float(starting_cash))
+        PaperAccount(starting_cash=float(starting_cash),
+                     path=paper_account_path(store)).reset(float(starting_cash))
     except ImportError:  # pragma: no cover - paper broker module missing
         log.warning("Papierkonto-Modul nicht verfügbar – nur Journal zurückgesetzt")
     journal = TradeJournal(journal_path(store, TradingMode.TEST))
@@ -296,8 +297,8 @@ class TradingBot:
         if self._paper_account is None:
             from tradebot.brokers.paper import PaperAccount
 
-            self._paper_account = PaperAccount(paper_account_path(self.store),
-                                               float(self.settings.paper_starting_cash))
+            self._paper_account = PaperAccount(starting_cash=float(self.settings.paper_starting_cash),
+                                               path=paper_account_path(self.store))
         return self._paper_account
 
     def _default_factory(self, key: str) -> Broker:
