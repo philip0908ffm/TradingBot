@@ -598,7 +598,17 @@ def build_trading_page(mode: TradingMode) -> None:
                 ui.label("Noch keine Ereignisse. Starte den Bot, um Käufe, Verkäufe und Hinweise hier "
                          "live zu sehen.").classes("tb-empty")
                 return
-            for ev in list(reversed(events))[:80]:
+            # collapse repeated identical hints (e.g. "Kaufsignal nicht ausgeführt …") into one row
+            collapsed: list[tuple[dict, int]] = []
+            for ev in reversed(events):
+                if collapsed and collapsed[-1][0].get("message") == ev.get("message") \
+                        and ev.get("kind") in (None, "info", "warning"):
+                    collapsed[-1] = (collapsed[-1][0], collapsed[-1][1] + 1)
+                else:
+                    collapsed.append((ev, 1))
+            for ev, count in collapsed[:80]:
+                if count > 1:
+                    ev = {**ev, "message": f"{ev.get('message', '')}  (×{count})"}
                 data = ev.get("data") or {}
                 icon, color = tc.kind_style(ev.get("kind"), ev.get("level"), data.get("pnl"))
                 with ui.element("div").classes("tb-event w-full"):
