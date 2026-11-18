@@ -1,0 +1,8 @@
+nicegui>=4.0
+ccxt>=4.5
+yfinance>=1.0
+alpaca-py>=0.40
+cryptography>=43
+pandas>=2.2
+numpy>=2.0
+pytest>=8

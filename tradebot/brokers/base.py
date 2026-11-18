@@ -1,0 +1,125 @@
+"""Broker abstraction.
+
+Every concrete broker (Binance, Alpaca, Yahoo data-only, Paper) implements ``Broker``.
+The rest of the application ONLY talks to this interface.
+
+Methods are synchronous; the trading engine calls them through ``asyncio.to_thread``.
+Implementations raise ``BrokerError`` (or a subclass) for any failure the user should see.
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime
+
+import pandas as pd
+
+from tradebot.core.models import AssetClass, Order, OrderType, Side
+
+
+class BrokerError(Exception):
+    """Any broker-related failure (network, auth, rejected order...)."""
+
+
+class AuthenticationError(BrokerError):
+    pass
+
+
+class NotSupportedError(BrokerError):
+    pass
+
+
+@dataclass
+class CredentialField:
+    """Describes one credential input for the Settings page."""
+
+    key: str  # e.g. "api_key"
+    label: str  # e.g. "API Key"
+    secret: bool = True  # render as password field
+
+
+@dataclass
+class BrokerInfo:
+    key: str  # registry key, e.g. "binance"
+    name: str  # display name
+    asset_classes: list[AssetClass]
+    supports_trading: bool  # False for data-only providers (yahoo)
+    requires_credentials_for_data: bool  # can we fetch prices without keys?
+    credential_fields: list[CredentialField] = field(default_factory=list)
+    has_sandbox: bool = False  # offers a testnet / paper environment on the broker side
+    quote_currency: str = "USDT"  # default cash currency
+    description: str = ""
+
+
+class Broker(ABC):
+    """Abstract broker. ``credentials`` keys correspond to ``info().credential_fields``.
+
+    ``options`` may contain broker-specific non-secret settings, e.g. ``{"sandbox": True}``.
+    """
+
+    def __init__(self, credentials: dict | None = None, options: dict | None = None) -> None:
+        self.credentials = credentials or {}
+        self.options = options or {}
+
+    # ---- metadata -------------------------------------------------------------------
+    @classmethod
+    @abstractmethod
+    def info(cls) -> BrokerInfo: ...
+
+    # ---- market data (must work without credentials if requires_credentials_for_data is False)
+    @abstractmethod
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int | None = None,
+    ) -> pd.DataFrame:
+        """Return candles as DataFrame (UTC DatetimeIndex; columns open, high, low, close, volume).
+
+        - ``start``/``end`` inclusive range; pagination handled internally.
+        - If only ``limit`` is given: the most recent ``limit`` candles.
+        - Implementations should only return CLOSED candles where feasible is NOT required;
+          the engine drops the last (possibly still forming) candle itself.
+        """
+
+    @abstractmethod
+    def fetch_price(self, symbol: str) -> float:
+        """Latest traded price."""
+
+    @abstractmethod
+    def list_symbols(self) -> list[str]:
+        """Tradable/known symbols (may be a curated list for data providers)."""
+
+    # ---- account (requires credentials) ---------------------------------------------
+    def test_connection(self) -> str:
+        """Verify credentials; return a human-readable success message or raise BrokerError."""
+        self.fetch_balance()
+        return "Verbindung erfolgreich"
+
+    @abstractmethod
+    def fetch_balance(self) -> dict[str, float]:
+        """Free balances per currency/asset, e.g. {"USDT": 1000.0, "BTC": 0.01}."""
+
+    @abstractmethod
+    def place_order(
+        self,
+        symbol: str,
+        side: Side,
+        quantity: float,
+        order_type: OrderType = OrderType.MARKET,
+        price: float | None = None,
+    ) -> Order:
+        """Submit an order. Returns the resulting Order (status, avg fill price, fee)."""
+
+    @abstractmethod
+    def cancel_order(self, order_id: str, symbol: str) -> None: ...
+
+    def normalize_quantity(self, symbol: str, quantity: float) -> float:
+        """Round quantity to the broker's lot-size rules. Default: unchanged."""
+        return quantity
+
+    def min_order_value(self, symbol: str) -> float:
+        """Minimum notional in quote currency. Default 0."""
+        return 0.0
