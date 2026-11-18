@@ -1,0 +1,61 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, "feature/**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed to attach the exe to a GitHub Release on tags
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller pywebview
+      - name: Build single-file EXE
+        run: nicegui-pack --onefile --windowed --name TradingBot main.py
+      - name: Build folder version (starts faster, fewer antivirus false positives)
+        run: nicegui-pack --windowed --name TradingBot-folder --distpath dist-folder main.py
+      - name: Smoke test (imports all modules, then exits)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\TradingBot.exe -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Selftest failed with exit code $($p.ExitCode)" }
+      - name: Zip folder version
+        shell: pwsh
+        run: Compress-Archive -Path dist-folder\TradingBot-folder\* -DestinationPath TradingBot-folder.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TradingBot-windows
+          path: |
+            dist/TradingBot.exe
+            TradingBot-folder.zip
+          retention-days: 30
+      - name: Attach to release (only for version tags like v1.0.0)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/TradingBot.exe
+            TradingBot-folder.zip
