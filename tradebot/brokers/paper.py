@@ -7,7 +7,8 @@ persist itself as JSON.
 ``PaperBroker`` wraps a data broker for prices and simulates fills:
 - market orders fill immediately at ``fetch_price`` ± ``slippage_pct``;
 - limit orders fill immediately if marketable (buy: limit >= price, sell: limit <= price) at
-  the slipped market price, capped at the limit; otherwise they are rejected with
+  the better of slipped market price and limit (buy: min(price*(1+slip), limit),
+  sell: max(price*(1-slip), limit)); otherwise they are rejected with
   ``NotSupportedError`` (no resting order book in paper mode);
 - a fee of ``fee_pct`` percent of the notional is charged in the cash currency.
 
@@ -20,6 +21,7 @@ import json
 import logging
 import os
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -37,6 +39,22 @@ from tradebot.core.models import AssetClass, Order, OrderStatus, OrderType, Side
 log = logging.getLogger(__name__)
 
 _EPS = 1e-12
+
+
+def order_from_dict(d: dict) -> Order:
+    """Rebuild an ``Order`` from ``Order.to_dict()`` output."""
+    return Order(
+        symbol=d["symbol"],
+        side=Side(d["side"]),
+        quantity=float(d["quantity"]),
+        order_type=OrderType(d.get("order_type", "market")),
+        price=None if d.get("price") is None else float(d["price"]),
+        status=OrderStatus(d.get("status", "filled")),
+        filled_quantity=float(d.get("filled_quantity", 0.0)),
+        fee=float(d.get("fee", 0.0)),
+        id=str(d["id"]),
+        created_at=datetime.fromisoformat(d["created_at"]),
+    )
 
 
 class PaperAccount:
@@ -112,6 +130,13 @@ class PaperAccount:
     def holding(self, symbol: str) -> float:
         with self._lock:
             return self.holdings.get(symbol, 0.0)
+
+    def find_order(self, order_id: str) -> dict | None:
+        with self._lock:
+            for d in reversed(self.orders):
+                if d.get("id") == order_id:
+                    return dict(d)
+        return None
 
     # ---- fills ----------------------------------------------------------------------
     def apply_fill(self, order: Order) -> None:
@@ -257,7 +282,17 @@ class PaperBroker(Broker):
         self.account.apply_fill(order)
         return order
 
+    def fetch_order(self, order_id: str, symbol: str) -> Order:
+        d = self.account.find_order(order_id)
+        if d is None:
+            raise BrokerError(f"Papierhandel: Order {order_id} nicht gefunden.")
+        return order_from_dict(d)
+
     def cancel_order(self, order_id: str, symbol: str) -> None:
-        raise NotSupportedError(
-            "Papierhandel: Orders werden sofort ausgeführt und können nicht storniert werden."
-        )
+        """Paper orders fill immediately, so there is never an open remainder to cancel.
+
+        Cancelling a known (already filled) order is a no-op; unknown ids raise.
+        """
+        if self.account.find_order(order_id) is None:
+            raise BrokerError(f"Papierhandel: Order {order_id} nicht gefunden.")
+        log.debug("Paper cancel_order(%s): already filled, nothing to cancel", order_id)

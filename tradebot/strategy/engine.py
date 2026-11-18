@@ -13,7 +13,8 @@ Semantics
 * ``offset`` shifts an operand N bars into the past.
 * NaN anywhere (indicator warm-up, offset, first bar of a cross) evaluates to ``False``.
 * Empty rule group: never True (neither entry nor exit).
-* ``logic`` "all" = AND, "any" = OR.
+* ``logic`` "all" = AND, "any" = OR, "min" = at least
+  ``risk.min_true_count(n, group.min_true_pct)`` conditions true ("Mindest-Signalstärke").
 """
 from __future__ import annotations
 
@@ -24,11 +25,13 @@ import pandas as pd
 
 from tradebot.core.models import OHLCV_COLUMNS, TIMEFRAMES
 from tradebot.indicators import registry  # package import registers all indicators
+from tradebot.strategy.risk import min_true_count, validate_risk
 from tradebot.strategy.models import (
     OPERATORS,
     PRICE_FIELDS,
     Condition,
     Operand,
+    RiskSettings,
     RuleGroup,
     Strategy,
 )
@@ -42,6 +45,7 @@ PRICE_FIELD_LABELS = {
 }
 
 LOGIC_LABELS = {"all": "alle", "any": "mindestens eine"}
+LOGICS = ("all", "any", "min")
 
 MIN_WARMUP = 50
 
@@ -117,6 +121,13 @@ def warmup_bars(strategy: Strategy) -> int:
     return max(MIN_WARMUP, 3 * largest + max_offset + 1)
 
 
+def candles_to_load(strategy: Strategy) -> int:
+    """Number of candles the live engine should load per evaluation."""
+    auto = warmup_bars(strategy) + 5
+    k = int(strategy.risk.klines_to_load or 0)
+    return max(k, auto) if k > 0 else auto
+
+
 # --------------------------------------------------------------------------- evaluation
 def _indicator_frame(key: str, params: dict | None, df: pd.DataFrame, cache: dict) -> pd.DataFrame:
     ck = _cache_key(key, params)
@@ -185,6 +196,9 @@ def evaluate_group(group: RuleGroup, df: pd.DataFrame, cache: dict | None = None
     parts = [evaluate_condition(c, df, cache).to_numpy() for c in group.conditions]
     if group.logic == "any":
         res = np.logical_or.reduce(parts)
+    elif group.logic == "min":
+        need = min_true_count(len(parts), group.min_true_pct)
+        res = np.sum(parts, axis=0) >= need
     else:
         res = np.logical_and.reduce(parts)
     return pd.Series(res, index=df.index, dtype=bool)
@@ -273,8 +287,15 @@ def _validate_operand(op: Operand, where: str) -> list[str]:
 
 def _validate_group(group: RuleGroup, label: str) -> list[str]:
     errors: list[str] = []
-    if group.logic not in ("all", "any"):
-        errors.append(f"{label}: Unbekannte Verknüpfung '{group.logic}' (erlaubt: all, any).")
+    if group.logic not in LOGICS:
+        errors.append(f"{label}: Unbekannte Verknüpfung '{group.logic}' (erlaubt: all, any, min).")
+    elif group.logic == "min":
+        try:
+            pct = float(group.min_true_pct)
+        except (TypeError, ValueError):
+            pct = float("nan")
+        if not (0 < pct <= 100):
+            errors.append(f"{label}: Mindest-Signalstärke muss zwischen 0 und 100 % liegen.")
     for i, cond in enumerate(group.conditions, start=1):
         where = f"{label}, Bedingung {i}"
         if cond.op not in OPERATORS:
@@ -301,42 +322,20 @@ def validate(strategy: Strategy) -> list[str]:
     errors += _validate_group(strategy.exit, "Ausstieg")
 
     r = strategy.risk
-
-    def num(v) -> float | None:
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return None
-        return f if math.isfinite(f) else None
-
-    ps = num(r.position_size_pct)
-    if ps is None or ps <= 0 or ps > 100:
-        errors.append("Positionsgröße muss zwischen 0 und 100 % liegen.")
-    if r.take_profit_pct is not None:
-        v = num(r.take_profit_pct)
-        if v is None or v <= 0:
-            errors.append("Take-Profit muss größer als 0 % sein (oder leer lassen).")
-    if r.stop_loss_pct is not None:
-        v = num(r.stop_loss_pct)
-        if v is None or v <= 0 or v >= 100:
-            errors.append("Stop-Loss muss zwischen 0 und 100 % liegen (oder leer lassen).")
-    if r.trailing_stop_pct is not None:
-        v = num(r.trailing_stop_pct)
-        if v is None or v <= 0 or v >= 100:
-            errors.append("Trailing-Stop muss zwischen 0 und 100 % liegen (oder leer lassen).")
-    if r.max_holding_bars is not None:
-        v = num(r.max_holding_bars)
-        if v is None or v < 1 or v != int(v):
-            errors.append("Maximale Haltedauer muss eine ganze Zahl ≥ 1 sein (oder leer lassen).")
-    v = num(r.max_open_positions)
-    if v is None or v < 1 or v != int(v):
-        errors.append("Maximale Anzahl offener Positionen muss eine ganze Zahl ≥ 1 sein.")
-    v = num(r.fee_pct)
-    if v is None or v < 0 or v >= 100:
-        errors.append("Gebühr muss zwischen 0 und 100 % liegen.")
-    v = num(r.slippage_pct)
-    if v is None or v < 0 or v >= 100:
-        errors.append("Slippage muss zwischen 0 und 100 % liegen.")
+    try:
+        errors += validate_risk(r)
+    except TypeError:
+        errors.append("Trading-Einstellungen enthalten ungültige (nicht numerische) Werte.")
+        return errors
+    if r.fee_pct >= 100 or r.slippage_pct >= 100:
+        errors.append("Gebühr und Slippage müssen unter 100 % liegen.")
+    if r.max_holding_bars is not None and r.max_holding_bars != int(r.max_holding_bars):
+        errors.append("Max. Haltedauer muss eine ganze Zahl sein.")
+    k = r.klines_to_load or 0
+    if k > 0:
+        wu = warmup_bars(strategy)
+        if k < wu:
+            errors.append(f"Zu wenige Kerzen für die Indikatoren: mindestens {wu}.")
     if (not strategy.exit.conditions and not r.take_profit_pct and not r.stop_loss_pct
             and not r.trailing_stop_pct and not r.max_holding_bars):
         errors.append(
@@ -380,6 +379,99 @@ def describe_group(group: RuleGroup) -> list[str]:
     return [describe_condition(c) for c in group.conditions]
 
 
+def describe_logic(group: RuleGroup) -> str:
+    """E.g. "alle 3 Bedingungen", "mindestens 2 von 4 Bedingungen (50 %)"."""
+    n = len(group.conditions)
+    if n <= 1:
+        return "die Bedingung"
+    if group.logic == "any":
+        return f"mindestens eine von {n} Bedingungen"
+    if group.logic == "min":
+        need = min_true_count(n, group.min_true_pct)
+        return f"mindestens {need} von {n} Bedingungen ({_fmt_de(group.min_true_pct)} %)"
+    return f"alle {n} Bedingungen"
+
+
+def _fmt_money(v) -> str:
+    f = float(v)
+    if f == int(f):
+        return f"{int(f):,}".replace(",", ".")
+    return f"{f:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = float(seconds)
+    if s >= 86400 and s % 86400 == 0:
+        return f"{_fmt_de(s / 86400)} Tag{'e' if s != 86400 else ''}"
+    if s >= 3600:
+        return f"{_fmt_de(round(s / 3600, 2))} h"
+    if s >= 60:
+        return f"{_fmt_de(round(s / 60, 2))} min"
+    return f"{_fmt_de(s)} s"
+
+
+def describe_risk(risk: RiskSettings) -> list[str]:
+    """German descriptions of the trading settings (only active/non-default ones, plus
+    position size and costs)."""
+    r, d = risk, RiskSettings()
+    out: list[str] = []
+    if r.position_size_mode == "fixed":
+        out.append(f"fester Kaufbetrag {_fmt_money(r.position_size_fixed)}")
+    else:
+        out.append(f"Positionsgröße {_fmt_de(r.position_size_pct)} % des Kapitals")
+    if r.min_order_value != d.min_order_value:
+        out.append(f"Mindest-Kaufbetrag {_fmt_money(r.min_order_value)}")
+    if r.max_order_value:
+        out.append(f"max. Kaufbetrag {_fmt_money(r.max_order_value)}")
+    if r.max_open_positions != d.max_open_positions:
+        out.append(f"max. {r.max_open_positions} offene Positionen insgesamt")
+    if r.max_positions_per_symbol > 1:
+        out.append(f"bis zu {r.max_positions_per_symbol} Positionen pro Symbol, Nachkauf ab "
+                   f"−{_fmt_de(r.add_position_min_drop_pct)} %")
+    if r.cooldown_seconds:
+        out.append(f"Cooldown {_fmt_duration(r.cooldown_seconds)} nach jedem Kauf")
+    if r.max_loss_streak:
+        n = r.max_loss_streak
+        what = f"Pause nach {n} Verlust{'en' if n != 1 else ''} in Folge"
+        if r.loss_streak_pause_hours and r.loss_streak_pause_hours > 0:
+            what += f" für {_fmt_de(r.loss_streak_pause_hours)} h"
+        else:
+            what += " bis zur manuellen Freigabe"
+        out.append(what)
+    if r.max_exposure_pct < 100:
+        out.append(f"max. {_fmt_de(r.max_exposure_pct)} % des Kapitals investiert")
+    if r.cash_reserve:
+        out.append(f"Cash-Reserve {_fmt_money(r.cash_reserve)}")
+    if r.klines_to_load:
+        out.append(f"{r.klines_to_load} Kerzen laden")
+    if r.buy_order_type == "limit":
+        out.append(f"Kauf als Limit-Order (Kurs × {_fmt_de(r.buy_price_multiple)})")
+    if r.take_profit_pct:
+        out.append(f"Take-Profit {_fmt_de(r.take_profit_pct)} %")
+    if r.stop_loss_pct:
+        out.append(f"Stop-Loss {_fmt_de(r.stop_loss_pct)} %")
+    if r.trailing_stop_pct:
+        t = f"Trailing-Stop {_fmt_de(r.trailing_stop_pct)} %"
+        if r.trailing_activation_pct:
+            t += f" ab +{_fmt_de(r.trailing_activation_pct)} %"
+        out.append(t)
+    if r.breakeven_trigger_pct is not None:
+        out.append(f"Break-Even ab +{_fmt_de(r.breakeven_trigger_pct)} %")
+    mp = []
+    if r.min_profit_pct:
+        mp.append(f"{_fmt_de(r.min_profit_pct)} %")
+    if r.min_profit_abs:
+        mp.append(_fmt_money(r.min_profit_abs))
+    if mp:
+        out.append("Mindestgewinn " + " und ".join(mp) + " (für Signal-Verkäufe)")
+    if r.max_holding_bars:
+        out.append(f"max. Haltedauer {int(r.max_holding_bars)} Kerzen")
+    if r.sell_order_type == "limit":
+        out.append(f"Verkauf als Limit-Order (Kurs × {_fmt_de(r.sell_price_multiple)})")
+    out.append(f"Gebühr {_fmt_de(r.fee_pct)} % / Slippage {_fmt_de(r.slippage_pct)} % je Seite")
+    return out
+
+
 def describe_strategy(strategy: Strategy) -> str:
     lines = [f"Strategie „{strategy.name}“ (Zeitrahmen {strategy.timeframe})"]
     if strategy.description:
@@ -392,23 +484,11 @@ def describe_strategy(strategy: Strategy) -> str:
         if len(group.conditions) == 1:
             lines.append(f"{title}, wenn:")
         else:
-            lines.append(f"{title}, wenn {LOGIC_LABELS.get(group.logic, group.logic)} "
-                         f"der folgenden Bedingungen erfüllt sind:")
+            verb = "ist" if group.logic == "any" else "sind"
+            lines.append(f"{title}, wenn {describe_logic(group)} erfüllt {verb}:")
         lines.extend(f"  • {d}" for d in describe_group(group))
 
     group_text(strategy.entry, "Kaufen")
     group_text(strategy.exit, "Verkaufen")
-
-    r = strategy.risk
-    risk = [f"Positionsgröße {_fmt_de(r.position_size_pct)} % des Kapitals"]
-    if r.take_profit_pct:
-        risk.append(f"Take-Profit {_fmt_de(r.take_profit_pct)} %")
-    if r.stop_loss_pct:
-        risk.append(f"Stop-Loss {_fmt_de(r.stop_loss_pct)} %")
-    if r.trailing_stop_pct:
-        risk.append(f"Trailing-Stop {_fmt_de(r.trailing_stop_pct)} %")
-    if r.max_holding_bars:
-        risk.append(f"max. Haltedauer {int(r.max_holding_bars)} Kerzen")
-    risk.append(f"Gebühr {_fmt_de(r.fee_pct)} % / Slippage {_fmt_de(r.slippage_pct)} % je Seite")
-    lines.append("Risiko: " + ", ".join(risk))
+    lines.append("Trading-Einstellungen: " + ", ".join(describe_risk(strategy.risk)))
     return "\n".join(lines)

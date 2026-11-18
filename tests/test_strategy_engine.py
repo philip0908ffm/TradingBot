@@ -184,7 +184,7 @@ def test_validate_messages():
         Condition(ind("does_not_exist"), ">", val(1)),
         Condition(ind("_test_two", "zzz"), "~", Operand("value", value=None)),
         Condition(ind("_test_sma", period=9999), ">", price("foo")),
-    ]), risk=RiskSettings(position_size_pct=150, stop_loss_pct=-1, take_profit_pct=0,
+    ]), risk=RiskSettings(position_size_pct=150, stop_loss_pct=-1, take_profit_pct=-5,
                           fee_pct=-1))
     errs = "\n".join(engine.validate(st))
     assert "Unbekannter Indikator 'does_not_exist'" in errs
@@ -256,3 +256,70 @@ def test_presets_validate_and_run():
         assert engine.describe_strategy(p)
         # JSON round trip
         assert Strategy.from_json(p.to_json()) == p
+
+
+# ---------------------------------------------------------------- logic "min" & new settings
+def test_logic_min_counts_and_nan():
+    df = make_df([1, 2, 3, 4, 5])
+    conds = [Condition(ind("_test_sma", period=3), ">", val(0)),  # NaN for bars 0,1
+             Condition(price(), ">", val(1)), Condition(price(), ">", val(3))]
+    g = RuleGroup("min", conds, min_true_pct=60)  # ceil(1.8) = 2 of 3; bar 1: NaN counts False
+    assert engine.evaluate_group(g, df).tolist() == [False, False, True, True, True]
+    g.min_true_pct = 100  # all three
+    assert engine.evaluate_group(g, df).tolist() == [False, False, False, True, True]
+    g.min_true_pct = 1  # at least one
+    assert engine.evaluate_group(g, df).tolist() == [False, True, True, True, True]
+
+
+def test_validate_min_logic_and_klines():
+    st = strat([Condition(price(), ">", val(1))], stop_loss_pct=2, logic="min")
+    assert engine.validate(st) == []
+    st.entry.min_true_pct = 0
+    assert any("Mindest-Signalstärke" in e for e in engine.validate(st))
+    st.entry.min_true_pct = 120
+    assert any("Mindest-Signalstärke" in e for e in engine.validate(st))
+    st.entry.min_true_pct = 50
+    st.entry.logic = "xor"
+    assert any("Unbekannte Verknüpfung" in e for e in engine.validate(st))
+    st = strat([Condition(ind("_test_sma", period=100), ">", val(1))], stop_loss_pct=2,
+               klines_to_load=200)
+    wu = engine.warmup_bars(st)
+    assert wu == 301
+    assert f"Zu wenige Kerzen für die Indikatoren: mindestens {wu}." in engine.validate(st)
+    assert engine.candles_to_load(st) == wu + 5
+    st.risk.klines_to_load = 1000
+    assert engine.validate(st) == [] and engine.candles_to_load(st) == 1000
+    st.risk.klines_to_load = 0
+    assert engine.candles_to_load(st) == wu + 5
+
+
+def test_validate_includes_validate_risk():
+    st = strat([Condition(price(), ">", val(1))], stop_loss_pct=2, max_positions_per_symbol=0,
+               buy_order_type="limit", buy_price_multiple=0.9, cash_reserve=-1)
+    errs = "\n".join(engine.validate(st))
+    assert "Max. Positionen pro Symbol" in errs
+    assert "Kauf-Preisfaktor" in errs
+    assert "Cash-Reserve" in errs
+
+
+def test_describe_min_logic_and_new_settings():
+    conds = [Condition(price(), ">", val(i)) for i in range(4)]
+    g = RuleGroup("min", conds, min_true_pct=50)
+    assert engine.describe_logic(g) == "mindestens 2 von 4 Bedingungen (50 %)"
+    st = strat(conds, [Condition(price(), "<", val(1))], logic="min", stop_loss_pct=2,
+               trailing_stop_pct=2, trailing_activation_pct=3, breakeven_trigger_pct=2,
+               min_profit_pct=0.5, max_positions_per_symbol=3, add_position_min_drop_pct=3,
+               max_loss_streak=3, loss_streak_pause_hours=24, cooldown_seconds=1800)
+    st.entry.min_true_pct = 50
+    text = engine.describe_strategy(st)
+    for part in ("mindestens 2 von 4 Bedingungen (50 %)", "Trailing-Stop 2 % ab +3 %",
+                 "Break-Even ab +2 %", "Mindestgewinn 0,5 %",
+                 "bis zu 3 Positionen pro Symbol, Nachkauf ab −3 %",
+                 "Pause nach 3 Verlusten in Folge für 24 h", "Cooldown 30 min"):
+        assert part in text, part
+    # defaults are not mentioned
+    plain = engine.describe_strategy(strat([Condition(price(), ">", val(1))], stop_loss_pct=2))
+    for word in ("Cooldown", "Pause", "Break-Even", "Mindestgewinn", "Nachkauf", "Limit"):
+        assert word not in plain
+    st.risk.max_loss_streak, st.risk.loss_streak_pause_hours = 2, 0
+    assert "Pause nach 2 Verlusten in Folge bis zur manuellen Freigabe" in engine.describe_strategy(st)

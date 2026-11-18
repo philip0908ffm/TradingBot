@@ -301,6 +301,15 @@ class CcxtBroker(Broker):
         self._require_credentials()
         self._call("cancel_order", order_id, symbol)
 
+    def fetch_order(self, order_id: str, symbol: str) -> Order:
+        self._require_credentials()
+        res = self._call("fetch_order", order_id, symbol) or {}
+        side = Side(str(res.get("side") or "buy").lower())
+        otype = OrderType.LIMIT if str(res.get("type") or "").lower() == "limit" else OrderType.MARKET
+        qty = float(res.get("amount") or 0.0)
+        price = float(res["price"]) if res.get("price") else None
+        return self._map_order(res, symbol, side, qty, otype, price)
+
     # ---- order mapping --------------------------------------------------------------
     def _map_order(self, res: dict, symbol: str, side: Side, qty: float,
                    order_type: OrderType, req_price: float | None) -> Order:

@@ -34,7 +34,8 @@ PRESETS: list[Strategy] = [
             _c(_price("close"), ">", _ind("ema", period=200)),
         ]),
         exit=RuleGroup("any", [_c(_ind("rsi", period=14), ">", _val(55))]),
-        risk=RiskSettings(position_size_pct=20, take_profit_pct=8, stop_loss_pct=4),
+        risk=RiskSettings(position_size_pct=20, take_profit_pct=8, stop_loss_pct=4,
+                          min_profit_pct=0.5, max_loss_streak=3, loss_streak_pause_hours=24),
     ),
     Strategy(
         name="MACD-Kreuzung",
@@ -65,17 +66,20 @@ PRESETS: list[Strategy] = [
         risk=RiskSettings(position_size_pct=50, take_profit_pct=None, stop_loss_pct=15),
     ),
     Strategy(
-        name="Bollinger-Abpraller",
+        name="Bollinger-Abpraller mit Nachkauf",
         timeframe="1h",
         description="Kauft, wenn der Kurs vom unteren Bollinger-Band wieder nach oben ins Band "
-                    "kreuzt; verkauft am Mittelband.",
+                    "kreuzt; kauft bis zu zweimal nach, wenn der Kurs mindestens 5 % unter dem "
+                    "letzten Kauf liegt (DCA). Verkauft am Mittelband.",
         entry=RuleGroup("all", [
             _c(_price("close"), "crosses_above", _ind("bbands", "lower", period=20, std=2.0)),
         ]),
         exit=RuleGroup("any", [
             _c(_price("close"), ">=", _ind("bbands", "middle", period=20, std=2.0)),
         ]),
-        risk=RiskSettings(position_size_pct=20, take_profit_pct=5, stop_loss_pct=3),
+        risk=RiskSettings(position_size_pct=10, take_profit_pct=6, stop_loss_pct=12,
+                          max_positions_per_symbol=3, add_position_min_drop_pct=5,
+                          cooldown_seconds=4 * 3600),
     ),
     Strategy(
         name="Supertrend-Trendfolge",
@@ -90,7 +94,8 @@ PRESETS: list[Strategy] = [
             _c(_ind("supertrend", "direction", period=10, multiplier=3.0), "crosses_below",
                _val(0)),
         ]),
-        risk=RiskSettings(position_size_pct=25, take_profit_pct=None, stop_loss_pct=10),
+        risk=RiskSettings(position_size_pct=25, take_profit_pct=None, stop_loss_pct=10,
+                          trailing_stop_pct=6, trailing_activation_pct=5),
     ),
     Strategy(
         name="Stochastik überverkauft",
@@ -135,7 +140,7 @@ PRESETS: list[Strategy] = [
             _c(_price("close"), "crosses_below", _ind("ema", period=50)),
         ]),
         risk=RiskSettings(position_size_pct=25, take_profit_pct=None, stop_loss_pct=6,
-                          trailing_stop_pct=8),
+                          trailing_stop_pct=8, breakeven_trigger_pct=3),
     ),
 ]
 

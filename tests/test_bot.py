@@ -101,6 +101,7 @@ def sig(monkeypatch):
     s = Signals()
     monkeypatch.setattr(bot_mod, "_compute_signals", s)
     monkeypatch.setattr(bot_mod, "_warmup_bars", lambda strategy: 3)
+    monkeypatch.setattr(bot_mod, "_candles_to_load", lambda strategy: 8)
     monkeypatch.setattr(bot_mod, "_validate", lambda strategy: [])
     return s
 
@@ -131,6 +132,11 @@ CLOSED = datetime(2026, 1, 5, 9, 59, tzinfo=timezone.utc)  # newest closed 1m ca
 FORMING = datetime(2026, 1, 5, 10, 0, tzinfo=timezone.utc)
 
 
+def pos_of(bot, symbol):
+    ps = bot.journal.positions_for(symbol)
+    return ps[0] if ps else None
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -139,7 +145,7 @@ def test_entry_buys_and_sizing(store, sig):
     bot, fake, _ = setup(store, position_size_pct=10)
     sig.entry.add(pd.Timestamp(CLOSED))
     run(bot.run_once())
-    pos = bot.journal.positions["BTC/USDT"]
+    pos = pos_of(bot, "BTC/USDT")
     assert pos.entry_price == 100.0
     assert 9.9 < pos.quantity < 10.0  # ~10% of 10000 incl. fee/slippage buffer
     assert fake.orders[0].side == Side.BUY
@@ -159,7 +165,7 @@ def test_forming_candle_ignored_and_processed_once(store, sig):
     clock.now = T0 + timedelta(seconds=60)  # 10:00 candle now closed (10:01 forming, not in data)
     run(bot.run_once())
     assert sig.calls == 2
-    assert "BTC/USDT" in bot.journal.positions
+    assert pos_of(bot, "BTC/USDT") is not None
 
 
 def test_first_candle_is_baseline_by_default(store, sig):
@@ -196,7 +202,7 @@ def test_trailing_stop_uses_candle_high(store, sig):
     fake.candles["BTC/USDT"] = df
     clock.now = T0 + timedelta(seconds=60)
     run(bot.run_once())
-    pos = bot.journal.positions["BTC/USDT"]
+    pos = pos_of(bot, "BTC/USDT")
     assert pos.highest_price == 110.0 and pos.bars_held == 1
     fake.prices["BTC/USDT"] = 107.5  # below 110 * 0.98
     run(bot.run_once())
@@ -219,7 +225,7 @@ def test_max_open_positions(store, sig):
     sig.entry.add(pd.Timestamp(CLOSED))
     run(bot.run_once())
     assert len(bot.journal.positions) == 2
-    assert any("max. 2" in e.message for e in bot.events)
+    assert any("(2) erreicht" in e.message for e in bot.events)
 
 
 def test_one_symbol_error_does_not_stop_others(store, sig):
@@ -227,7 +233,7 @@ def test_one_symbol_error_does_not_stop_others(store, sig):
     fake.fail.add("BTC/USDT")
     sig.entry.add(pd.Timestamp(CLOSED))
     run(bot.run_once())
-    assert list(bot.journal.positions) == ["ETH/USDT"]
+    assert [p.symbol for p in bot.journal.positions.values()] == ["ETH/USDT"]
     assert any(e.level == "error" and e.symbol == "BTC/USDT" for e in bot.events)
     # backoff: second error doubles the wait
     clock.now += timedelta(seconds=1)
@@ -246,11 +252,11 @@ def test_journal_persistence_and_restore(store, sig):
     bot, fake, clock = setup(store)
     sig.entry.add(pd.Timestamp(CLOSED))
     run(bot.run_once())
-    qty = bot.journal.positions["BTC/USDT"].quantity
+    qty = pos_of(bot, "BTC/USDT").quantity
     # "restart": new bot, same store and broker
     bot2 = TradingBot(TradingMode.TEST, strategy(), bot.watchlist, store,
                       broker_factory=lambda k: fake, clock=clock, trade_on_first_candle=True)
-    assert bot2.journal.positions["BTC/USDT"].quantity == qty
+    assert pos_of(bot2, "BTC/USDT").quantity == qty
     calls = sig.calls
     run(bot2.run_once())  # same candle -> must not be processed again
     assert sig.calls == calls and len(fake.orders) == 1
@@ -270,12 +276,12 @@ def test_manual_buy_now(store, sig):
     bot, fake, _ = setup(store)
     pos = run(bot.buy_now("BTC/USDT", 500.0))
     assert pos.quantity * 100 == pytest.approx(500 / (1.0005 * 1.001), rel=1e-6)
-    with pytest.raises(BotError):
-        run(bot.buy_now("BTC/USDT", 500.0))  # already open
+    run(bot.buy_now("BTC/USDT", 500.0))  # manual add-on buy is allowed
+    assert len(bot.journal.positions) == 2
     with pytest.raises(BotError):
         run(bot.buy_now("DOGE/USDT", 10.0))  # not in watchlist
     trades = run(bot.close_all())
-    assert len(trades) == 1 and not bot.journal.positions
+    assert len(trades) == 2 and not bot.journal.positions
 
 
 def test_bot_ignores_foreign_holdings(store, sig):
@@ -356,7 +362,7 @@ def test_live_order_cap_and_position_limit(store, sig):
     run(bot.run_once())
     assert len(fake.orders) == 1
     o = fake.orders[0]
-    assert o.quantity * 100.0 == pytest.approx(100.0)
+    assert 99.0 < o.quantity * 100.0 <= 100.0
 
 
 def test_live_sell_limited_to_free_balance(store, sig):

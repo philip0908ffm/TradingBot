@@ -511,8 +511,9 @@ def test_paper_insufficient_and_limits():
     assert o.price == pytest.approx(100.01)
     with pytest.raises(NotSupportedError):
         pb.place_order("BTC/USDT", Side.BUY, 1, OrderType.LIMIT, price=90)
-    with pytest.raises(NotSupportedError):
+    with pytest.raises(BrokerError, match="nicht gefunden"):
         pb.cancel_order("x", "BTC/USDT")
+    pb.cancel_order(o.id, "BTC/USDT")  # filled -> no-op
     assert acc.equity({"BTC/USDT": 110}) == pytest.approx(acc.cash + 110)
 
 
@@ -605,3 +606,63 @@ def test_live_binance_mirror():
 def test_live_yahoo():
     df = YahooBroker().fetch_ohlcv("AAPL", "1d", limit=30)
     assert 20 <= len(df) <= 30
+
+
+# ---------------------------------------------------------------- fetch_order / limit flow
+def test_base_fetch_order_default_not_supported():
+    with pytest.raises(NotSupportedError, match="Orderstatus"):
+        StubData().fetch_order("1", "BTC/USDT")
+
+
+def test_ccxt_fetch_order_mapping():
+    b = make_ccxt()
+    b.exchange.fetch_order = MagicMock(return_value={
+        "id": "77", "status": "open", "side": "sell", "type": "limit", "amount": 2.0,
+        "filled": 0.5, "average": 101.0, "price": 100.9, "fee": {"currency": "USDT", "cost": 0.05}})
+    o = b.fetch_order("77", "ETH/USDT")
+    b.exchange.fetch_order.assert_called_once_with("77", "ETH/USDT")
+    assert o.id == "77" and o.side == Side.SELL and o.order_type == OrderType.LIMIT
+    assert o.status == OrderStatus.PARTIALLY_FILLED and o.filled_quantity == 0.5
+    assert o.price == 101.0 and o.fee == pytest.approx(0.05) and o.quantity == 2.0
+    b.exchange.fetch_order = MagicMock(side_effect=ccxt.OrderNotFound("x"))
+    with pytest.raises(BrokerError, match="nicht gefunden"):
+        b.fetch_order("78", "ETH/USDT")
+
+
+def test_alpaca_fetch_order_mapping():
+    b = make_alpaca()
+    b.trading_client.get_order_by_id.return_value = SimpleNamespace(
+        id="u-9", symbol="AAPL", side=SimpleNamespace(value="sell"),
+        order_type=SimpleNamespace(value="limit"), status=SimpleNamespace(value="partially_filled"),
+        qty="4", filled_qty="1.5", filled_avg_price="187.2", limit_price="187.0", submitted_at=T0)
+    o = b.fetch_order("u-9", "AAPL")
+    b.trading_client.get_order_by_id.assert_called_once_with("u-9")
+    assert o.side == Side.SELL and o.order_type == OrderType.LIMIT
+    assert o.status == OrderStatus.PARTIALLY_FILLED and o.filled_quantity == 1.5
+    assert o.price == 187.2 and o.quantity == 4.0
+
+
+def test_paper_marketable_limit_fills_and_fetch_order(tmp_path):
+    acc = PaperAccount(10_000, path=tmp_path / "acc.json")
+    pb = PaperBroker(StubData(100.0), acc, fee_pct=0.1, slippage_pct=0.05)
+    # engine style: buy limit at price*1.001 -> better of slipped market (100.05) and limit (100.1)
+    buy = pb.place_order("BTC/USDT", Side.BUY, 2, OrderType.LIMIT, price=100.0 * 1.001)
+    assert buy.price == pytest.approx(100.05) and buy.status == OrderStatus.FILLED
+    # tight limit below slipped price -> capped at limit
+    buy2 = pb.place_order("BTC/USDT", Side.BUY, 1, OrderType.LIMIT, price=100.02)
+    assert buy2.price == pytest.approx(100.02)
+    sell = pb.place_order("BTC/USDT", Side.SELL, 2, OrderType.LIMIT, price=100.0 * 0.999)
+    assert sell.price == pytest.approx(99.95)
+    sell2 = pb.place_order("BTC/USDT", Side.SELL, 1, OrderType.LIMIT, price=99.98)
+    assert sell2.price == pytest.approx(99.98)
+    assert acc.holdings == {}
+    fetched = pb.fetch_order(buy.id, "BTC/USDT")
+    assert fetched.id == buy.id and fetched.status == OrderStatus.FILLED
+    assert fetched.order_type == OrderType.LIMIT and fetched.side == Side.BUY
+    assert fetched.filled_quantity == 2 and fetched.price == pytest.approx(buy.price)
+    assert fetched.fee == pytest.approx(buy.fee) and fetched.created_at == buy.created_at
+    # survives persistence
+    again = PaperBroker(StubData(), PaperAccount(path=tmp_path / "acc.json"))
+    assert again.fetch_order(sell.id, "BTC/USDT").price == pytest.approx(99.95)
+    with pytest.raises(BrokerError, match="nicht gefunden"):
+        pb.fetch_order("missing", "BTC/USDT")

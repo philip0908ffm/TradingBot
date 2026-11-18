@@ -6,8 +6,12 @@ One ``TradingBot`` runs one strategy over a watchlist in one ``TradingMode``:
 * LIVE: real orders, guarded by several safety switches (master switch, per-order cap,
   daily loss kill switch, max open positions).
 
-Exits and sizing use ``tradebot.strategy.risk`` so live behaviour matches the backtest.
-The bot only manages positions it opened itself (recorded in its ``TradeJournal``).
+All buy/sell rules come from ``tradebot.strategy.risk`` so live behaviour matches the
+backtest. The bot only manages positions it opened itself (recorded in its ``TradeJournal``);
+several positions per symbol are possible (``risk.max_positions_per_symbol``).
+
+A bot object that was never started can still be used for manual actions
+(``sell_position``, ``buy_manual``, ``wallet``) – the ``BotManager`` relies on that.
 """
 from __future__ import annotations
 
@@ -23,13 +27,14 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from tradebot.brokers.base import Broker, BrokerError
+from tradebot.brokers.base import Broker, BrokerError, NotSupportedError
 from tradebot.core.models import (
     TIMEFRAMES,
     ClosedTrade,
     ExitReason,
     Order,
     OrderStatus,
+    OrderType,
     Position,
     Side,
     TradingMode,
@@ -38,13 +43,17 @@ from tradebot.core.models import (
 )
 from tradebot.core.settings import AppSettings, SettingsStore
 from tradebot.engine.journal import TradeJournal
+from tradebot.strategy import risk as R
 from tradebot.strategy.models import RiskSettings, Strategy
-from tradebot.strategy.risk import check_exit, position_quantity, stop_levels, update_after_bar
 
 log = logging.getLogger(__name__)
 
 EVENT_LEVELS = ("info", "warning", "error", "trade")
+EVENT_KINDS = ("buy", "sell", "stop_loss", "take_profit", "trailing_stop", "error",
+               "kill_switch", "info", "warning", "paused", "external_closed")
 MAX_BACKOFF_SECONDS = 600.0
+FULL_FILL_TOLERANCE = 0.999  # sold >= 99.9 % of requested quantity -> position fully closed
+DUST_RATIO = 1e-3  # free balance below 0.1 % of the position -> treated as "not held anymore"
 
 EXIT_REASON_LABELS = {
     ExitReason.SIGNAL: "Ausstiegssignal",
@@ -54,6 +63,11 @@ EXIT_REASON_LABELS = {
     ExitReason.MAX_BARS: "Max. Haltedauer",
     ExitReason.MANUAL: "Manuell",
     ExitReason.END_OF_DATA: "Datenende",
+}
+EXIT_REASON_KINDS = {
+    ExitReason.TAKE_PROFIT: "take_profit",
+    ExitReason.STOP_LOSS: "stop_loss",
+    ExitReason.TRAILING_STOP: "trailing_stop",
 }
 
 
@@ -74,14 +88,29 @@ def _warmup_bars(strategy: Strategy) -> int:
     return int(warmup_bars(strategy))
 
 
+def _candles_to_load(strategy: Strategy) -> int:
+    from tradebot.strategy import engine
+
+    fn = getattr(engine, "candles_to_load", None)
+    if fn is not None:
+        return int(fn(strategy))
+    if strategy.risk.klines_to_load:
+        return int(strategy.risk.klines_to_load)
+    return _warmup_bars(strategy) + 5
+
+
 def _validate(strategy: Strategy) -> list[str]:
     from tradebot.strategy.engine import validate
 
-    return list(validate(strategy))
+    problems = list(validate(strategy))
+    for msg in R.validate_risk(strategy.risk):
+        if msg not in problems:
+            problems.append(msg)
+    return problems
 
 
 def journal_path(store: SettingsStore, mode: TradingMode) -> Path:
-    return store.state_dir / f"journal_{mode.value}.json"
+    return store.state_dir / f"journal_{TradingMode(mode).value}.json"
 
 
 def paper_account_path(store: SettingsStore) -> Path:
@@ -105,14 +134,67 @@ class BotEvent:
     level: str  # "info" | "warning" | "error" | "trade"
     message: str
     symbol: str | None = None
+    kind: str = "info"  # see EVENT_KINDS – lets the GUI pick a sound
+    data: dict = field(default_factory=dict)  # symbol, qty, price, pnl, pnl_pct, reason ...
 
     def to_dict(self) -> dict:
-        return {"time": self.time.isoformat(), "level": self.level,
-                "message": self.message, "symbol": self.symbol}
+        return {"time": self.time.isoformat(), "level": self.level, "message": self.message,
+                "symbol": self.symbol, "kind": self.kind, "data": dict(self.data)}
 
 
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
+
+
+def position_info(journal: TradeJournal, pos: Position, price: float | None, risk: RiskSettings) -> dict:
+    """GUI/wallet view of one bot position."""
+    cur = price if price else pos.entry_price
+    entry_fee = journal.entry_fees.get(pos.id)
+    cost = pos.quantity * pos.entry_price
+    net_pnl = R.estimated_net_pnl(pos, cur, risk, entry_fee)
+    return {
+        "id": pos.id,
+        "symbol": pos.symbol,
+        "broker": journal.position_brokers.get(pos.id),
+        "quantity": pos.quantity,
+        "entry_price": pos.entry_price,
+        "entry_time": pos.entry_time.isoformat(),
+        "entry_fee": entry_fee,
+        "cost": cost,
+        "current_price": price,
+        "value": pos.market_value(cur),
+        "market_value": pos.market_value(cur),
+        "unrealized_pnl": pos.unrealized_pnl(cur),
+        "unrealized_pnl_pct": pos.unrealized_pnl_pct(cur),
+        "estimated_net_proceeds": R.estimated_net_proceeds(pos, cur, risk),
+        "estimated_net_pnl": net_pnl,
+        "estimated_net_pnl_pct": net_pnl / cost * 100.0 if cost else 0.0,
+        "highest_price": pos.highest_price,
+        "bars_held": pos.bars_held,
+        "strategy": pos.strategy,
+        "stop_levels": R.stop_levels(pos, risk),
+        "external_closed": pos.id in journal.external_closed,
+    }
+
+
+def symbol_state_info(journal: TradeJournal, risk: RiskSettings, now: datetime) -> dict[str, dict]:
+    out = {}
+    for sym, st in journal.symbol_states.items():
+        cooldown_until = None
+        if risk.cooldown_seconds and st.last_buy_time:
+            cu = st.last_buy_time + timedelta(seconds=risk.cooldown_seconds)
+            cooldown_until = cu if cu > now else None
+        paused = st.paused_indefinitely or bool(st.paused_until and st.paused_until > now)
+        out[sym] = {
+            "paused": paused,
+            "paused_until": _iso(st.paused_until) if st.paused_until and st.paused_until > now else None,
+            "paused_indefinitely": st.paused_indefinitely,
+            "loss_streak": st.loss_streak,
+            "cooldown_until": _iso(cooldown_until),
+            "last_buy_time": _iso(st.last_buy_time),
+            "last_entry_price": st.last_entry_price,
+        }
+    return out
 
 
 def build_status(
@@ -130,35 +212,20 @@ def build_status(
     events: list[BotEvent] | None = None,
     max_open_positions: int | None = None,
     killed: bool = False,
+    now: datetime | None = None,
 ) -> dict:
+    risk = risk or RiskSettings()
+    now = now or utcnow()
     prices = prices if prices is not None else journal.last_prices
-    positions = []
-    for sym, pos in journal.positions.items():
-        price = prices.get(sym)
-        cur = price if price else pos.entry_price
-        positions.append({
-            "id": pos.id,
-            "symbol": sym,
-            "broker": journal.position_brokers.get(sym),
-            "quantity": pos.quantity,
-            "entry_price": pos.entry_price,
-            "entry_time": pos.entry_time.isoformat(),
-            "current_price": price,
-            "market_value": pos.market_value(cur),
-            "unrealized_pnl": pos.unrealized_pnl(cur),
-            "unrealized_pnl_pct": pos.unrealized_pnl_pct(cur),
-            "highest_price": pos.highest_price,
-            "bars_held": pos.bars_held,
-            "strategy": pos.strategy,
-            "stop_levels": stop_levels(pos, risk) if risk else None,
-        })
+    positions = [position_info(journal, p, prices.get(p.symbol), risk)
+                 for p in sorted(journal.positions.values(), key=lambda p: p.entry_time)]
     if equity is None and journal.equity_history:
         equity = journal.equity_history[-1][1]
     start = journal.start_equity
     pnl = (equity - start) if (equity is not None and start) else None
     return {
         "running": running,
-        "mode": mode.value,
+        "mode": TradingMode(mode).value,
         "strategy": strategy_name or journal.strategy_name,
         "started_at": _iso(started_at),
         "last_loop_at": _iso(last_loop_at),
@@ -169,16 +236,17 @@ def build_status(
         "pnl_pct": (pnl / start * 100.0) if (pnl is not None and start) else None,
         "realized_pnl": sum(t.pnl for t in journal.closed_trades),
         "positions": positions,
+        "symbol_states": symbol_state_info(journal, risk, now),
         "closed_trades": [t.to_dict() for t in journal.closed_trades],
         "equity_history": [list(x) for x in journal.equity_history],
         "events": [e.to_dict() for e in (events or [])],
         "max_open_positions": max_open_positions,
-        "kill_switch": killed or (journal.kill_switch_date == utcnow().date().isoformat()),
+        "kill_switch": killed or (journal.kill_switch_date == now.date().isoformat()),
         "daily_start_equity": (journal.daily_start or {}).get("equity"),
     }
 
 
-def journal_status(mode: TradingMode, store: SettingsStore) -> dict:
+def journal_status(mode: TradingMode, store: SettingsStore, events: list[BotEvent] | None = None) -> dict:
     """Status of a mode while no bot is running (last persisted state)."""
     journal = TradeJournal(journal_path(store, mode))
     risk = None
@@ -187,7 +255,8 @@ def journal_status(mode: TradingMode, store: SettingsStore) -> dict:
             risk = store.load_strategy(journal.strategy_name).risk
         except (KeyError, ValueError):
             risk = None
-    return build_status(journal, mode, running=False, strategy_name=journal.strategy_name, risk=risk)
+    return build_status(journal, mode, running=False, strategy_name=journal.strategy_name,
+                        risk=risk, events=events)
 
 
 def reset_paper_state(store: SettingsStore, starting_cash: float) -> None:
@@ -203,6 +272,14 @@ def reset_paper_state(store: SettingsStore, starting_cash: float) -> None:
     journal.reset()
     journal.start_equity = float(starting_cash)
     journal.save()
+
+
+def _filled_qty(order: Order) -> float:
+    if order.filled_quantity and order.filled_quantity > 0:
+        return float(order.filled_quantity)
+    if order.status == OrderStatus.FILLED:
+        return float(order.quantity)
+    return 0.0
 
 
 class TradingBot:
@@ -228,6 +305,7 @@ class TradingBot:
         # If False, the first closed candle seen per symbol only sets the baseline
         # (avoid acting on stale signals right after start).
         self.trade_on_first_candle = trade_on_first_candle
+        self.order_poll_seconds = 1.0  # fetch_order polling interval for pending orders
         self.journal = TradeJournal(journal_path(store, self.mode))
 
         self._factory = broker_factory
@@ -237,6 +315,7 @@ class TradingBot:
         self._balance_cache: dict[str, dict[str, float]] = {}
         self._prices: dict[str, float] = dict(self.journal.last_prices)
         self._errors: dict[str, tuple[int, datetime]] = {}
+        self._blocked_seen: dict[str, tuple[str, str]] = {}  # symbol -> (reason, candle)
         self._events: deque[BotEvent] = deque(maxlen=500)
         self._subscribers: list[Callable[[BotEvent], Any]] = []
         self._task: asyncio.Task | None = None
@@ -256,8 +335,12 @@ class TradingBot:
         return self._running
 
     @property
+    def risk(self) -> RiskSettings:
+        return self.strategy.risk
+
+    @property
     def max_open_positions(self) -> int:
-        n = int(self.strategy.risk.max_open_positions)
+        n = int(self.risk.max_open_positions)
         if self.mode == TradingMode.LIVE:
             n = min(n, int(self.settings.live_max_open_positions))
         return max(n, 0)
@@ -277,8 +360,14 @@ class TradingBot:
 
         return unsubscribe
 
-    def _emit(self, level: str, message: str, symbol: str | None = None) -> BotEvent:
-        ev = BotEvent(self.clock(), level, message, symbol)
+    def _emit(self, level: str, message: str, symbol: str | None = None,
+              kind: str | None = None, data: dict | None = None) -> BotEvent:
+        if kind is None:
+            kind = {"error": "error", "warning": "warning"}.get(level, "info")
+        payload = dict(data or {})
+        if symbol and "symbol" not in payload:
+            payload["symbol"] = symbol
+        ev = BotEvent(self.clock(), level, message, symbol, kind, payload)
         self._events.append(ev)
         prefix = f"[{self.mode.value.upper()}] "
         pylevel = {"warning": logging.WARNING, "error": logging.ERROR}.get(level, logging.INFO)
@@ -312,8 +401,7 @@ class TradingBot:
 
         data = create_broker(key, creds, options)
         return PaperBroker(data_broker=data, account=self._get_paper_account(),
-                           fee_pct=self.strategy.risk.fee_pct,
-                           slippage_pct=self.strategy.risk.slippage_pct)
+                           fee_pct=self.risk.fee_pct, slippage_pct=self.risk.slippage_pct)
 
     def get_broker(self, key: str) -> Broker:
         b = self._brokers.get(key)
@@ -332,8 +420,8 @@ class TradingBot:
         except Exception:  # noqa: BLE001
             return "USD"
 
-    async def _balance(self, broker_key: str) -> dict[str, float]:
-        if broker_key not in self._balance_cache:
+    async def _balance(self, broker_key: str, fresh: bool = False) -> dict[str, float]:
+        if fresh or broker_key not in self._balance_cache:
             broker = self.get_broker(broker_key)
             self._balance_cache[broker_key] = dict(await asyncio.to_thread(broker.fetch_balance))
         return self._balance_cache[broker_key]
@@ -359,8 +447,10 @@ class TradingBot:
         for w in self.watchlist:
             if w.enabled:
                 pairs.add((w.broker, self._quote_for(w.broker, w.symbol)))
-        for sym, key in self.journal.position_brokers.items():
-            pairs.add((key, self._quote_for(key, sym)))
+        for pid, key in self.journal.position_brokers.items():
+            pos = self.journal.positions.get(pid)
+            if pos is not None:
+                pairs.add((key, self._quote_for(key, pos.symbol)))
         total = 0.0
         for key, quote in sorted(pairs):
             try:
@@ -371,11 +461,13 @@ class TradingBot:
             total += float(bal.get(quote, 0.0) or 0.0)
         return total
 
+    def _invested_value(self) -> float:
+        return sum(p.quantity * (self._prices.get(p.symbol) or p.entry_price)
+                   for i, p in self.journal.positions.items() if i not in self.journal.external_closed)
+
     async def _compute_equity(self) -> tuple[float, float]:
         cash = await self._total_cash()
-        value = sum(p.quantity * (self._prices.get(s) or p.entry_price)
-                    for s, p in self.journal.positions.items())
-        return cash + value, cash
+        return cash + self._invested_value(), cash
 
     def _get_lock(self) -> asyncio.Lock:
         loop = asyncio.get_running_loop()
@@ -383,6 +475,24 @@ class TradingBot:
             self._lock = asyncio.Lock()
             self._lock_loop = loop
         return self._lock
+
+    def _require_manual_trading(self, broker_key: str, buying: bool) -> Broker:
+        """Safety checks for manual actions (also without running bot)."""
+        try:
+            broker = self.get_broker(broker_key)
+            info = broker.info()
+        except Exception as exc:  # noqa: BLE001
+            raise BotError(f"Broker '{broker_key}' konnte nicht initialisiert werden: {exc}") from exc
+        if self.mode == TradingMode.LIVE:
+            if not self.settings.live_enabled:
+                raise BotError("Live-Handel ist in den Einstellungen deaktiviert")
+            if not info.supports_trading:
+                raise BotError(f"{info.name} unterstützt keinen Handel")
+            if info.credential_fields and not self.store.has_credentials(broker_key):
+                raise BotError(f"Für {info.name} sind keine API-Zugangsdaten hinterlegt")
+            if buying and self.journal.kill_switch_date == self.clock().date().isoformat():
+                raise BotError("Der Verlust-Notschalter wurde heute ausgelöst – keine Käufe möglich")
+        return broker
 
     # ---- lifecycle --------------------------------------------------------------------
     async def _preflight(self) -> None:
@@ -408,8 +518,6 @@ class TradingBot:
             try:
                 broker = self.get_broker(key)
                 info = broker.info()
-            except BrokerError as exc:
-                raise BotError(f"Broker '{key}' konnte nicht initialisiert werden: {exc}") from exc
             except Exception as exc:  # noqa: BLE001
                 raise BotError(f"Broker '{key}' konnte nicht initialisiert werden: {exc}") from exc
             if self.mode != TradingMode.LIVE:
@@ -433,11 +541,18 @@ class TradingBot:
         self._killed = False
         self.started_at = self.clock()
         self.journal.strategy_name = self.strategy.name
+        # "loss_streak_pause_hours == 0" means: paused until bot restart or manual release
+        released = [s for s, st in self.journal.symbol_states.items() if st.paused_indefinitely]
+        for s in released:
+            self.journal.symbol_states[s].paused_indefinitely = False
+        self.journal.save()
         self._wake = asyncio.Event()
         mode_label = "LIVE (echtes Geld)" if self.mode == TradingMode.LIVE else "TEST (Papierhandel)"
         self._emit("info", f"Bot gestartet: {mode_label}, Strategie '{self.strategy.name}', "
                            f"{sum(w.enabled for w in self.watchlist)} Werte, "
                            f"Intervall {self.poll_seconds}s")
+        if released:
+            self._emit("info", "Pausierte Symbole durch Neustart freigegeben: " + ", ".join(released))
         self._task = asyncio.create_task(self._loop(), name=f"tradebot-{self.mode.value}")
 
     async def stop(self) -> None:
@@ -451,7 +566,7 @@ class TradingBot:
         if task is not None and task is not asyncio.current_task():
             try:
                 # graceful: let a running iteration finish (never abort mid-order)
-                await asyncio.wait_for(asyncio.shield(task), timeout=60)
+                await asyncio.wait_for(asyncio.shield(task), timeout=120)
             except asyncio.TimeoutError:
                 task.cancel()
             except Exception:  # noqa: BLE001
@@ -483,10 +598,15 @@ class TradingBot:
             now = self.clock()
             self._balance_cache.clear()
             items = [w for w in self.watchlist if w.enabled]
-            seen = {w.symbol for w in items}
+            seen = {(w.broker, w.symbol) for w in items}
             # keep managing exits of bot positions whose symbol was removed from the watchlist
-            orphans = [WatchItem(s, k) for s, k in self.journal.position_brokers.items() if s not in seen]
-            for item, candles in [(w, True) for w in items] + [(w, False) for w in orphans]:
+            orphans = {}
+            for pid, pos in self.journal.positions.items():
+                key = self.journal.position_brokers.get(pid)
+                if key and (key, pos.symbol) not in seen:
+                    orphans[(key, pos.symbol)] = WatchItem(pos.symbol, key)
+            work = [(w, True) for w in items] + [(w, False) for w in orphans.values()]
+            for item, candles in work:
                 key = f"{item.broker}:{item.symbol}"
                 err = self._errors.get(key)
                 if err and now < err[1]:
@@ -532,8 +652,13 @@ class TradingBot:
                     self._wake.set()
                 self._emit("error", f"NOTSCHALTER: Tagesverlust {loss_pct:.2f}% erreicht "
                                     f"(Limit {limit:.2f}%) – Bot wurde gestoppt. "
-                                    "Offene Positionen bleiben bestehen.")
+                                    "Offene Positionen bleiben bestehen.",
+                           kind="kill_switch", data={"loss_pct": loss_pct, "equity": equity})
         self.journal.save()
+
+    def _own_positions(self, symbol: str, broker: str) -> list[Position]:
+        return [p for p in self.journal.positions_for(symbol, broker)
+                if p.id not in self.journal.external_closed]
 
     async def _process_symbol(self, item: WatchItem, now: datetime, candles: bool = True) -> None:
         sym = item.symbol
@@ -541,21 +666,20 @@ class TradingBot:
         price = float(await asyncio.to_thread(broker.fetch_price, sym))
         if price > 0:
             self._prices[sym] = price
-        pos = self.journal.positions.get(sym)
-        own = pos is not None and self.journal.position_brokers.get(sym, item.broker) == item.broker
         exited = False
-        # (a) protective exits on the live price tick
-        if own and price > 0:
-            hit = check_exit(pos, self.strategy.risk, price, price, price)
-            if hit:
-                await self._sell(item.broker, sym, hit[0], price)
-                exited = True
+        # (a) protective exits on the live price tick, per position
+        if price > 0:
+            for pos in self._own_positions(sym, item.broker):
+                hit = R.check_exit(pos, self.risk, price, price, price)
+                if hit:
+                    if await self._sell(pos.id, hit[0], price) is not None:
+                        exited = True
         if not candles:
             return
         # (b) new closed candle -> signals
         tf = self.strategy.timeframe
         tf_seconds = TIMEFRAMES[tf]
-        limit = _warmup_bars(self.strategy) + 5
+        limit = max(int(_candles_to_load(self.strategy)), 2)
         df = await asyncio.to_thread(functools.partial(broker.fetch_ohlcv, sym, tf, limit=limit))
         if df is None or len(df) == 0:
             return
@@ -563,22 +687,19 @@ class TradingBot:
         if idx.tz is None:
             idx = idx.tz_localize("UTC")
             df = df.set_axis(idx)
-        closed_mask = (idx + pd.Timedelta(seconds=tf_seconds)) <= pd.Timestamp(now)
-        closed = df[closed_mask]
+        closed = df[(idx + pd.Timedelta(seconds=tf_seconds)) <= pd.Timestamp(now)]
         if len(closed) == 0:
             return
         last_ts = closed.index[-1]
-        key = f"{item.broker}:{sym}"
-        prev_iso = self.journal.last_candle.get(key)
+        ckey = f"{item.broker}:{sym}"
+        prev_iso = self.journal.last_candle.get(ckey)
         prev = pd.Timestamp(prev_iso) if prev_iso else None
         if prev is not None and last_ts <= prev:
             return  # already processed
-        self.journal.last_candle[key] = last_ts.isoformat()
+        self.journal.last_candle[ckey] = last_ts.isoformat()
         new_bars = closed[closed.index > prev] if prev is not None else closed.iloc[-1:]
-        pos = self.journal.positions.get(sym)
-        own = pos is not None and self.journal.position_brokers.get(sym, item.broker) == item.broker
-        if own:
-            update_after_bar(pos, float(new_bars["high"].max()))
+        for pos in self._own_positions(sym, item.broker):
+            R.update_after_bar(pos, float(new_bars["high"].max()))
             pos.bars_held += max(len(new_bars) - 1, 0)
         if prev is None and not self.trade_on_first_candle:
             return
@@ -586,112 +707,236 @@ class TradingBot:
         if signals is None or len(signals) == 0:
             return
         row = signals.iloc[-1]
-        entry = bool(row.get("entry", False)) if hasattr(row, "get") else False
-        exit_ = bool(row.get("exit", False)) if hasattr(row, "get") else False
-        if own and exit_:
-            await self._sell(item.broker, sym, ExitReason.SIGNAL, price)
-        elif pos is None and entry and not exited:
-            await self._buy(item, price, reason="Einstiegssignal")
+        entry = bool(row.get("entry", False))
+        exit_ = bool(row.get("exit", False))
+        if exit_:
+            for pos in self._own_positions(sym, item.broker):
+                if R.signal_exit_allowed(pos, price, self.risk, self.journal.entry_fees.get(pos.id)):
+                    if await self._sell(pos.id, ExitReason.SIGNAL, price) is not None:
+                        exited = True
+                else:
+                    self._emit("info", f"{sym}: Ausstiegssignal ignoriert – Mindestgewinn "
+                                       "nicht erreicht", sym)
+        if entry and not exited:
+            await self._signal_buy(item, price, now, last_ts.isoformat())
+
+    async def _signal_buy(self, item: WatchItem, price: float, now: datetime, candle: str) -> None:
+        sym = item.symbol
+        if self._killed:
+            return
+        n_sym = len(self.journal.positions_for(sym))
+        allowed, reason = R.can_open(self.journal.state(sym), n_sym, len(self.journal.positions),
+                                     price, now, self.risk, max_open_positions=self.max_open_positions)
+        if not allowed:
+            if self._blocked_seen.get(sym) != (reason, candle):
+                self._blocked_seen[sym] = (reason, candle)
+                self._emit("info", f"{sym}: Kaufsignal nicht ausgeführt – {reason}", sym)
+            return
+        cash = await self._cash_for(item.broker, sym)
+        equity, _ = await self._compute_equity()
+        hard_cap = float(self.settings.live_max_order_value) if self.mode == TradingMode.LIVE else None
+        budget = R.order_budget(equity, cash, self._invested_value(), self.risk, hard_cap=hard_cap)
+        if budget <= 0:
+            msg = (f"{sym}: Kaufsignal nicht ausgeführt – kein ausreichendes Budget "
+                   f"(verfügbar {cash:.2f}, Mindestbetrag {self.risk.min_order_value:.2f})")
+            if self._blocked_seen.get(sym) != (msg, candle):
+                self._blocked_seen[sym] = (msg, candle)
+                self._emit("info", msg, sym)
+            return
+        await self._buy(item, price, budget, reason="Einstiegssignal")
 
     # ---- orders -----------------------------------------------------------------------
     def _fee(self, order: Order, qty: float, price: float) -> float:
         if order.fee and order.fee > 0:
             return float(order.fee)
-        return qty * price * self.strategy.risk.fee_pct / 100.0
+        return qty * price * self.risk.fee_pct / 100.0
 
-    @staticmethod
-    def _check_order(order: Order, action: str, symbol: str) -> None:
-        if order.status in (OrderStatus.REJECTED, OrderStatus.CANCELED):
-            raise BrokerError(f"{action}-Order für {symbol} wurde abgelehnt ({order.status.value})")
+    async def _cancel(self, broker: Broker, order: Order, sym: str) -> None:
+        try:
+            await asyncio.to_thread(broker.cancel_order, order.id, sym)
+        except BrokerError as exc:
+            log.warning("Order %s konnte nicht storniert werden: %s", order.id, exc)
 
-    async def _buy(self, item: WatchItem, price: float, *, reason: str,
-                   quote_amount: float | None = None, manual: bool = False) -> tuple[Position | None, str]:
-        sym = item.symbol
-        if self._killed:
-            return None, "Notschalter aktiv – keine neuen Käufe"
-        if sym in self.journal.positions:
-            return None, f"Für {sym} ist bereits eine Position offen"
-        if len(self.journal.positions) >= self.max_open_positions:
-            msg = f"{sym}: Kaufsignal ignoriert – max. {self.max_open_positions} offene Positionen erreicht"
-            self._emit("info", msg, sym)
-            return None, msg
-        if self.mode == TradingMode.LIVE and not self.settings.live_enabled:
-            return None, "Live-Handel ist in den Einstellungen deaktiviert"
-        if price <= 0:
-            return None, f"{sym}: kein gültiger Kurs"
-        broker = self.get_broker(item.broker)
-        risk = self.strategy.risk
-        cash = await self._cash_for(item.broker, sym)
-        if quote_amount is not None:
-            budget = min(float(quote_amount), cash)
-            eff = price * (1 + risk.slippage_pct / 100) * (1 + risk.fee_pct / 100)
-            qty = max(budget / eff, 0.0)
+    async def _execute(self, broker: Broker, sym: str, side: Side, qty: float, ref_price: float) -> Order:
+        """Place an order (market or limit per strategy) and reconcile its final fill."""
+        lp = R.limit_price(side.value, ref_price, self.risk)
+        if lp:
+            order = await asyncio.to_thread(broker.place_order, sym, side, qty, OrderType.LIMIT, lp)
         else:
-            equity, _ = await self._compute_equity()
-            qty = position_quantity(equity, cash, price, risk)
-        if self.mode == TradingMode.LIVE:
-            cap = float(self.settings.live_max_order_value)
-            if qty * price > cap:
-                qty = cap / price
-                self._emit("info", f"{sym}: Ordergröße auf Live-Maximum {cap:.2f} begrenzt", sym)
-        qty = float(broker.normalize_quantity(sym, qty))
+            order = await asyncio.to_thread(broker.place_order, sym, side, qty)
+        self._balance_cache.clear()
+        if order.status in (OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.CANCELED):
+            return order
+        is_limit = lp is not None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(self.settings.order_timeout_seconds)
+        fetch = getattr(broker, "fetch_order", None)
+        while True:
+            try:
+                if fetch is None:
+                    raise NotSupportedError("fetch_order")
+                current = await asyncio.to_thread(fetch, order.id, sym)
+            except NotSupportedError:
+                # broker can't report order state: treat the returned order as final
+                if not is_limit and not order.filled_quantity:
+                    order.status = OrderStatus.FILLED
+                    order.filled_quantity = order.quantity
+                    self._emit("warning", f"{sym}: Orderstatus nicht abrufbar – Market-Order wird "
+                                          "als ausgeführt angenommen", sym)
+                elif is_limit and order.status != OrderStatus.FILLED:
+                    await self._cancel(broker, order, sym)
+                return order
+            except BrokerError as exc:
+                log.warning("Orderstatus %s nicht abrufbar: %s", order.id, exc)
+                current = None
+            if current is not None:
+                if not current.quantity:
+                    current.quantity = order.quantity
+                order = current
+                if order.status in (OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.CANCELED):
+                    self._balance_cache.clear()
+                    return order
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(self.order_poll_seconds)
+        # timeout: cancel the remainder, then read the final fill once more
+        await self._cancel(broker, order, sym)
+        if fetch is not None:
+            try:
+                order = await asyncio.to_thread(fetch, order.id, sym)
+            except BrokerError:
+                pass
+        self._balance_cache.clear()
+        self._emit("warning", f"{sym}: Order nach {self.settings.order_timeout_seconds}s nicht "
+                              f"vollständig ausgeführt – Rest storniert "
+                              f"(ausgeführt {_filled_qty(order):.8g} von {qty:.8g})", sym)
+        return order
+
+    async def _buy(self, item: WatchItem, price: float, budget: float, *, reason: str) -> Position | None:
+        """Buy for ``budget`` (quote, incl. fees). Returns the new position or None (skipped)."""
+        sym = item.symbol
+        broker = self.get_broker(item.broker)
+        qty = float(broker.normalize_quantity(sym, R.quantity_for_budget(budget, price, self.risk)))
         min_value = float(broker.min_order_value(sym) or 0.0)
         if qty <= 0 or qty * price < min_value:
-            msg = (f"{sym}: Kauf übersprungen – Ordergröße zu klein "
-                   f"({qty * price:.2f}, Minimum {min_value:.2f}, verfügbar {cash:.2f})")
-            self._emit("info", msg, sym)
-            return None, msg
+            self._emit("info", f"{sym}: Kauf übersprungen – Ordergröße zu klein "
+                               f"({qty * price:.2f}, Minimum {min_value:.2f})", sym)
+            return None
         if self.mode == TradingMode.LIVE and qty * price > float(self.settings.live_max_order_value) * 1.001:
-            msg = f"{sym}: Kauf übersprungen – Ordergröße überschreitet das Live-Maximum"
-            self._emit("warning", msg, sym)
-            return None, msg
-        order = await asyncio.to_thread(broker.place_order, sym, Side.BUY, qty)
-        self._balance_cache.pop(item.broker, None)
-        self._check_order(order, "Kauf", sym)
-        filled = float(order.filled_quantity or 0.0) or qty
-        if order.status == OrderStatus.NEW and not order.filled_quantity:
-            self._emit("warning", f"{sym}: Kauforder angenommen, aber noch nicht ausgeführt", sym)
+            self._emit("warning", f"{sym}: Kauf übersprungen – Ordergröße überschreitet das Live-Maximum", sym)
+            return None
+        order = await self._execute(broker, sym, Side.BUY, qty, price)
+        if order.status == OrderStatus.REJECTED and not order.filled_quantity:
+            raise BrokerError(f"Kauforder für {sym} wurde abgelehnt")
+        filled = _filled_qty(order)
+        if filled <= 0:
+            self._emit("warning", f"{sym}: Kauforder nicht ausgeführt – keine Position eröffnet", sym)
+            return None
         fill_price = float(order.price or price)
         fee = self._fee(order, filled, fill_price)
-        pos = Position(symbol=sym, quantity=filled, entry_price=fill_price,
-                       entry_time=self.clock(), strategy=self.strategy.name)
+        now = self.clock()
+        pos = Position(symbol=sym, quantity=filled, entry_price=fill_price, entry_time=now,
+                       strategy=self.strategy.name)
         self.journal.open_position(pos, item.broker, fee)
+        R.register_buy(self.journal.state(sym), fill_price, now)
         self.journal.save()
         self._emit("trade", f"KAUF {sym}: {filled:.8g} @ {fill_price:.6g} "
-                            f"(Wert {filled * fill_price:.2f}, Gebühr {fee:.4f}) – {reason}", sym)
-        return pos, "ok"
+                            f"(Wert {filled * fill_price:.2f}, Gebühr {fee:.4f}) – {reason}", sym,
+                   kind="buy", data={"qty": filled, "price": fill_price, "fee": fee,
+                                     "value": filled * fill_price, "position_id": pos.id})
+        return pos
 
-    async def _sell(self, broker_key: str, sym: str, reason: ExitReason, price: float) -> ClosedTrade:
-        pos = self.journal.positions.get(sym)
+    async def _mark_external(self, pos: Position, free: float | None) -> None:
+        self.journal.external_closed.add(pos.id)
+        self.journal.save()
+        self._emit("error", f"{pos.symbol}: Position {pos.id} ist beim Broker nicht mehr vorhanden "
+                            f"(Bestand {free or 0:.8g}) – vermutlich außerhalb des Bots verkauft. "
+                            "Bitte im Wallet prüfen und 'Position vergessen' bestätigen.",
+                   pos.symbol, kind="external_closed",
+                   data={"position_id": pos.id, "qty": pos.quantity, "free": free})
+
+    async def _sell(self, pos_id: str, reason: ExitReason, price: float) -> ClosedTrade | None:
+        """Sell one bot position. Returns the ClosedTrade, or None if nothing was filled
+        (position stays open) / the position is no longer held at the broker."""
+        pos = self.journal.positions.get(pos_id)
         if pos is None:
-            raise BotError(f"Keine Bot-Position für {sym}")
-        broker = self.get_broker(broker_key)
+            raise BotError(f"Keine Bot-Position mit ID {pos_id}")
+        sym = pos.symbol
+        key = self.journal.position_brokers.get(pos_id)
+        if key is None:
+            raise BotError(f"Broker der Position {pos_id} unbekannt")
+        broker = self.get_broker(key)
         qty = pos.quantity
         if self.mode == TradingMode.LIVE:
-            # fees may have been deducted in the base asset -> never sell more than we hold
-            bal = await self._balance(broker_key)
+            bal = await self._balance(key, fresh=True)
             free = bal.get(base_of(sym))
-            if free is not None and 0 < float(free) < qty:
-                qty = float(free)
+            if free is not None:
+                free = float(free)
+                if free <= qty * DUST_RATIO:
+                    await self._mark_external(pos, free)
+                    return None
+                if free < qty:  # fees may have been deducted in the base asset
+                    qty = free
         qty = float(broker.normalize_quantity(sym, qty))
         if qty <= 0:
             raise BrokerError(f"Verkaufsmenge für {sym} ist nach Rundung 0")
-        order = await asyncio.to_thread(broker.place_order, sym, Side.SELL, qty)
-        self._balance_cache.pop(broker_key, None)
-        self._check_order(order, "Verkauf", sym)
-        sold = float(order.filled_quantity or 0.0) or qty
+        try:
+            order = await self._execute(broker, sym, Side.SELL, qty, price)
+            if order.status == OrderStatus.REJECTED and not order.filled_quantity:
+                raise BrokerError(f"Verkaufsorder für {sym} wurde abgelehnt")
+        except BrokerError:
+            if self.mode == TradingMode.LIVE:
+                try:
+                    free = (await self._balance(key, fresh=True)).get(base_of(sym))
+                except BrokerError:
+                    free = -1.0
+                if free is not None and 0 <= float(free) <= pos.quantity * DUST_RATIO:
+                    await self._mark_external(pos, float(free))
+                    return None
+            raise
+        sold = _filled_qty(order)
+        if sold <= 0:
+            self._emit("warning", f"{sym}: Verkaufsorder nicht ausgeführt – Position bleibt offen", sym)
+            return None
         fill_price = float(order.price or price)
         exit_fee = self._fee(order, sold, fill_price)
-        entry_fee = self.journal.entry_fees.get(pos.id, 0.0)
+        entry_fee_total = self.journal.entry_fees.get(pos_id, 0.0)
+        now = self.clock()
+        full = sold >= qty * FULL_FILL_TOLERANCE
+        if full:
+            entry_fee = entry_fee_total
+        else:
+            share = min(sold / pos.quantity, 1.0)
+            entry_fee = entry_fee_total * share
         trade = ClosedTrade(symbol=sym, quantity=sold, entry_price=pos.entry_price,
-                            exit_price=fill_price, entry_time=pos.entry_time,
-                            exit_time=self.clock(), fees=entry_fee + exit_fee,
-                            exit_reason=reason, strategy=pos.strategy)
-        self.journal.close_position(sym, trade)
+                            exit_price=fill_price, entry_time=pos.entry_time, exit_time=now,
+                            fees=entry_fee + exit_fee, exit_reason=reason, strategy=pos.strategy)
+        if full:
+            self.journal.close_position(pos_id, trade)
+            remaining = self.journal.positions_for(sym)
+            paused = R.register_close(self.journal.state(sym), trade.pnl, now, self.risk,
+                                      remaining_entry_price=remaining[-1].entry_price if remaining else None)
+        else:
+            pos.quantity -= sold
+            self.journal.entry_fees[pos_id] = entry_fee_total - entry_fee
+            self.journal.add_trade(trade)
+            paused = False
         self.journal.save()
-        self._emit("trade", f"VERKAUF {sym}: {sold:.8g} @ {fill_price:.6g} – "
-                            f"{EXIT_REASON_LABELS.get(reason, reason.value)}, "
-                            f"Ergebnis {trade.pnl:+.2f} ({trade.pnl_pct:+.2f}%)", sym)
+        label = EXIT_REASON_LABELS.get(reason, reason.value)
+        part = "" if full else f" (Teilverkauf, Rest {pos.quantity:.8g})"
+        self._emit("trade", f"VERKAUF {sym}: {sold:.8g} @ {fill_price:.6g} – {label}, "
+                            f"Ergebnis {trade.pnl:+.2f} ({trade.pnl_pct:+.2f}%){part}", sym,
+                   kind=EXIT_REASON_KINDS.get(reason, "sell"),
+                   data={"qty": sold, "price": fill_price, "pnl": trade.pnl, "pnl_pct": trade.pnl_pct,
+                         "reason": reason.value, "position_id": pos_id, "partial": not full})
+        if paused:
+            st = self.journal.state(sym)
+            until = (f"bis {st.paused_until:%d.%m.%Y %H:%M} UTC" if st.paused_until and not st.paused_indefinitely
+                     else "bis zur manuellen Freigabe oder zum Neustart")
+            self._emit("warning", f"Symbol {sym} pausiert nach {self.risk.max_loss_streak} Verlusten "
+                                  f"in Folge – keine neuen Käufe {until}", sym, kind="paused",
+                       data={"paused_until": _iso(st.paused_until),
+                             "paused_indefinitely": st.paused_indefinitely})
         return trade
 
     # ---- manual control ---------------------------------------------------------------
@@ -699,54 +944,114 @@ class TradingBot:
         for w in self.watchlist:
             if w.symbol == symbol:
                 return w
-        key = self.journal.position_brokers.get(symbol)
-        if key:
-            return WatchItem(symbol, key)
+        for p in self.journal.positions_for(symbol):
+            key = self.journal.position_brokers.get(p.id)
+            if key:
+                return WatchItem(symbol, key)
         raise BotError(f"{symbol} ist nicht in der Watchlist")
 
-    async def close_position(self, symbol: str) -> ClosedTrade:
+    async def sell_position(self, position_id: str) -> ClosedTrade:
+        """Manually sell one bot position (reason MANUAL)."""
         async with self._get_lock():
-            if symbol not in self.journal.positions:
-                raise BotError(f"Keine offene Bot-Position für {symbol}")
-            key = self.journal.position_brokers.get(symbol) or self._find_item(symbol).broker
-            broker = self.get_broker(key)
+            pos = self.journal.positions.get(position_id)
+            if pos is None:
+                raise BotError(f"Keine offene Bot-Position mit ID {position_id}")
+            if position_id in self.journal.external_closed:
+                raise BotError(f"Position {position_id} ist beim Broker nicht mehr vorhanden – "
+                               "bitte 'Position vergessen' verwenden")
+            key = self.journal.position_brokers.get(position_id) or self._find_item(pos.symbol).broker
+            broker = self._require_manual_trading(key, buying=False)
             try:
-                price = float(await asyncio.to_thread(broker.fetch_price, symbol))
-                self._prices[symbol] = price
-                return await self._sell(key, symbol, ExitReason.MANUAL, price)
+                price = float(await asyncio.to_thread(broker.fetch_price, pos.symbol))
+                self._prices[pos.symbol] = price
+                trade = await self._sell(position_id, ExitReason.MANUAL, price)
             except BrokerError as exc:
-                self._emit("error", f"{symbol}: manueller Verkauf fehlgeschlagen ({exc})", symbol)
-                raise BotError(f"Verkauf von {symbol} fehlgeschlagen: {exc}") from exc
+                self._emit("error", f"{pos.symbol}: manueller Verkauf fehlgeschlagen ({exc})", pos.symbol)
+                raise BotError(f"Verkauf von {pos.symbol} fehlgeschlagen: {exc}") from exc
+            if trade is None:
+                raise BotError(f"Verkauf von {pos.symbol} wurde nicht ausgeführt")
+            return trade
+
+    async def close_position(self, symbol: str) -> list[ClosedTrade]:
+        """Sell all bot positions of ``symbol``."""
+        ids = [p.id for p in self.journal.positions_for(symbol)
+               if p.id not in self.journal.external_closed]
+        if not ids:
+            raise BotError(f"Keine offene Bot-Position für {symbol}")
+        trades, errors = [], []
+        for pid in ids:
+            try:
+                trades.append(await self.sell_position(pid))
+            except BotError as exc:
+                errors.append(str(exc))
+        if errors and not trades:
+            raise BotError("; ".join(errors))
+        return trades
 
     async def close_all(self) -> list[ClosedTrade]:
         trades = []
-        for sym in list(self.journal.positions):
+        for pid in list(self.journal.positions):
+            if pid in self.journal.external_closed:
+                continue
             try:
-                trades.append(await self.close_position(sym))
+                trades.append(await self.sell_position(pid))
             except BotError:
                 pass  # already reported as event
         return trades
 
-    async def buy_now(self, symbol: str, quote_amount: float) -> Position:
+    async def buy_manual(self, broker_key: str, symbol: str, quote_amount: float) -> Position:
+        """Manual buy of ``quote_amount`` (quote currency incl. fees), tracked like a bot position.
+
+        Ignores cooldown/pause/re-entry rules (explicit user decision) but respects the
+        total position limit, cash, the cash reserve and – in LIVE – the per-order hard cap.
+        """
         if quote_amount is None or quote_amount <= 0:
             raise BotError("Bitte einen Betrag größer 0 angeben")
         async with self._get_lock():
-            item = self._find_item(symbol)
-            broker = self.get_broker(item.broker)
-            if self.mode == TradingMode.LIVE:
-                if not broker.info().supports_trading:
-                    raise BotError(f"{broker.info().name} unterstützt keinen Handel")
+            broker = self._require_manual_trading(broker_key, buying=True)
+            if len(self.journal.positions) >= self.max_open_positions:
+                raise BotError(f"Maximale Anzahl offener Positionen ({self.max_open_positions}) erreicht")
             try:
                 price = float(await asyncio.to_thread(broker.fetch_price, symbol))
+                if price <= 0:
+                    raise BotError(f"{symbol}: kein gültiger Kurs")
                 self._prices[symbol] = price
-                pos, msg = await self._buy(item, price, reason="manueller Kauf",
-                                           quote_amount=quote_amount, manual=True)
+                cash = await self._cash_for(broker_key, symbol)
+                budget = min(float(quote_amount), cash - self.risk.cash_reserve)
+                if self.mode == TradingMode.LIVE:
+                    budget = min(budget, float(self.settings.live_max_order_value))
+                if budget <= 0:
+                    raise BotError(f"Nicht genügend Guthaben (verfügbar {cash:.2f})")
+                pos = await self._buy(WatchItem(symbol, broker_key), price, budget, reason="manueller Kauf")
             except BrokerError as exc:
                 self._emit("error", f"{symbol}: manueller Kauf fehlgeschlagen ({exc})", symbol)
                 raise BotError(f"Kauf von {symbol} fehlgeschlagen: {exc}") from exc
             if pos is None:
-                raise BotError(msg)
+                last = self._events[-1].message if self._events else ""
+                raise BotError(last or f"Kauf von {symbol} wurde nicht ausgeführt")
             return pos
+
+    async def buy_now(self, symbol: str, quote_amount: float) -> Position:
+        """Manual buy of a watchlist symbol."""
+        return await self.buy_manual(self._find_item(symbol).broker, symbol, quote_amount)
+
+    async def forget_position(self, position_id: str) -> None:
+        """Remove a position from the journal (after the user confirmed it is gone)."""
+        async with self._get_lock():
+            pos = self.journal.remove_position(position_id)
+            if pos is None:
+                raise BotError(f"Keine Bot-Position mit ID {position_id}")
+            remaining = self.journal.positions_for(pos.symbol)
+            self.journal.state(pos.symbol).last_entry_price = remaining[-1].entry_price if remaining else None
+            self.journal.save()
+            self._emit("warning", f"{pos.symbol}: Position {position_id} aus dem Journal entfernt "
+                                  "(manuell bestätigt)", pos.symbol)
+
+    def resume_symbol(self, symbol: str) -> None:
+        """Manual release of a paused symbol."""
+        R.resume_symbol(self.journal.state(symbol))
+        self.journal.save()
+        self._emit("info", f"{symbol}: Pause aufgehoben – Käufe wieder erlaubt", symbol)
 
     def reset_kill_switch(self) -> None:
         """Allow LIVE trading again on the day the kill switch fired (explicit user action)."""
@@ -770,11 +1075,89 @@ class TradingBot:
         self.equity = self.cash = None
         self._emit("info", f"Testkonto zurückgesetzt auf {float(starting_cash):.2f}")
 
+    # ---- wallet -----------------------------------------------------------------------
+    async def wallet(self) -> dict:
+        """Positions with CURRENT prices, cash, equity, totals (+ LIVE broker holdings)."""
+        errors: list[str] = []
+        pairs = {(self.journal.position_brokers.get(pid), p.symbol) for pid, p in self.journal.positions.items()}
+        for key, sym in sorted(pairs, key=lambda x: (x[0] or "", x[1])):
+            if not key:
+                continue
+            try:
+                broker = self.get_broker(key)
+                self._prices[sym] = float(await asyncio.to_thread(broker.fetch_price, sym))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{sym}: Kurs nicht abrufbar ({exc})")
+        self._balance_cache.clear()
+        try:
+            equity, cash = await self._compute_equity()
+        except Exception as exc:  # noqa: BLE001
+            equity = cash = None
+            errors.append(f"Kontostand nicht abrufbar ({exc})")
+        now = self.clock()
+        positions = [position_info(self.journal, p, self._prices.get(p.symbol), self.risk)
+                     for p in sorted(self.journal.positions.values(), key=lambda p: p.entry_time)]
+        active = [p for p in positions if not p["external_closed"]]
+        totals = {
+            "positions": len(active),
+            "cost": sum(p["cost"] for p in active),
+            "value": sum(p["value"] for p in active),
+            "unrealized_pnl": sum(p["unrealized_pnl"] for p in active),
+            "estimated_net_proceeds": sum(p["estimated_net_proceeds"] for p in active),
+            "estimated_net_pnl": sum(p["estimated_net_pnl"] for p in active),
+            "realized_pnl": sum(t.pnl for t in self.journal.closed_trades),
+        }
+        result = {
+            "mode": self.mode.value,
+            "running": self._running,
+            "time": now.isoformat(),
+            "cash": cash,
+            "equity": equity,
+            "start_equity": self.journal.start_equity,
+            "positions": positions,
+            "totals": totals,
+            "symbol_states": symbol_state_info(self.journal, self.risk, now),
+            "errors": errors,
+        }
+        if self.mode == TradingMode.LIVE:
+            result["broker_holdings"] = await self._broker_holdings()
+        return result
+
+    async def _broker_holdings(self) -> dict[str, dict]:
+        """Per broker with credentials: balances NOT managed by the bot (read-only info)."""
+        keys = set(self.settings.broker_options) | {w.broker for w in self.watchlist}
+        keys |= set(self.journal.position_brokers.values())
+        out: dict[str, dict] = {}
+        for key in sorted(keys):
+            if not self.store.has_credentials(key):
+                continue
+            try:
+                bal = await self._balance(key, fresh=True)
+            except Exception as exc:  # noqa: BLE001
+                out[key] = {"holdings": [], "error": str(exc)}
+                continue
+            managed: dict[str, float] = {}
+            for pid, p in self.journal.positions.items():
+                if self.journal.position_brokers.get(pid) == key and pid not in self.journal.external_closed:
+                    managed[base_of(p.symbol)] = managed.get(base_of(p.symbol), 0.0) + p.quantity
+            holdings = []
+            for asset, amount in sorted(bal.items()):
+                try:
+                    amount = float(amount or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                external = amount - managed.get(asset, 0.0)
+                if external > 1e-12:
+                    holdings.append({"asset": asset, "total": amount,
+                                     "bot_quantity": managed.get(asset, 0.0), "quantity": external})
+            out[key] = {"holdings": holdings, "error": None}
+        return out
+
     # ---- status -----------------------------------------------------------------------
     def status(self) -> dict:
         return build_status(
             self.journal, self.mode, running=self._running, strategy_name=self.strategy.name,
-            risk=self.strategy.risk, started_at=self.started_at, last_loop_at=self.last_loop_at,
+            risk=self.risk, started_at=self.started_at, last_loop_at=self.last_loop_at,
             equity=self.equity, cash=self.cash, prices=self._prices, events=list(self._events),
-            max_open_positions=self.max_open_positions, killed=self._killed,
+            max_open_positions=self.max_open_positions, killed=self._killed, now=self.clock(),
         )

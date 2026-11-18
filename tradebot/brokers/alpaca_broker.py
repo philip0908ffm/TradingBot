@@ -353,6 +353,14 @@ class AlpacaBroker(Broker):
     def cancel_order(self, order_id: str, symbol: str) -> None:
         self._wrap(self.trading_client.cancel_order_by_id, order_id)
 
+    def fetch_order(self, order_id: str, symbol: str) -> Order:
+        res = self._wrap(self.trading_client.get_order_by_id, order_id)
+        side = Side.SELL if _enum_value(getattr(res, "side", "buy")) == "sell" else Side.BUY
+        otype_raw = _enum_value(getattr(res, "order_type", None) or getattr(res, "type", None))
+        otype = OrderType.LIMIT if otype_raw == "limit" else OrderType.MARKET
+        qty = float(getattr(res, "qty", None) or 0.0)
+        return self._map_order(res, getattr(res, "symbol", None) or symbol, side, qty, otype, None)
+
     def normalize_quantity(self, symbol: str, quantity: float) -> float:
         # Alpaca accepts up to 9 decimal places for fractional shares; round down.
         q = float(quantity)

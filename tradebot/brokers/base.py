@@ -136,6 +136,12 @@ class Broker(ABC):
     @abstractmethod
     def cancel_order(self, order_id: str, symbol: str) -> None: ...
 
+    def fetch_order(self, order_id: str, symbol: str) -> Order:
+        """Current state of an order (status, filled qty, avg price, fee). Default: unsupported."""
+        raise NotSupportedError(
+            f"{self.info().name}: Abfrage des Orderstatus wird nicht unterstützt."
+        )
+
     def normalize_quantity(self, symbol: str, quantity: float) -> float:
         """Round quantity to the broker's lot-size rules. Default: unchanged."""
         return quantity

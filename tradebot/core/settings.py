@@ -107,6 +107,13 @@ def _default_watchlist() -> list[WatchItem]:
     ]
 
 
+SOUND_EVENTS = ("buy", "sell_profit", "sell_loss", "stop_loss", "take_profit", "error")
+
+
+def _default_sound_events() -> dict[str, bool]:
+    return {k: True for k in SOUND_EVENTS}
+
+
 def _default_broker_options() -> dict[str, dict]:
     return {
         "binance": {"sandbox": False, "public_data_mirror": False},
@@ -128,6 +135,10 @@ class AppSettings:
     active_strategy_test: str | None = None
     active_strategy_live: str | None = None
     theme: str = "dark"
+    order_timeout_seconds: int = 30  # wait for limit/pending orders, then cancel the rest
+    sound_enabled: bool = True
+    sound_volume: float = 0.6  # 0..1
+    sound_events: dict[str, bool] = field(default_factory=_default_sound_events)
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {}
@@ -135,6 +146,7 @@ class AppSettings:
             d[f.name] = getattr(self, f.name)
         d["watchlist"] = [w.to_dict() for w in self.watchlist]
         d["broker_options"] = {k: dict(v) for k, v in self.broker_options.items()}
+        d["sound_events"] = dict(self.sound_events)
         return d
 
     @classmethod
@@ -145,7 +157,7 @@ class AppSettings:
             return s
         defaults = cls()
         for f in fields(cls):
-            if f.name not in d or f.name in ("watchlist", "broker_options"):
+            if f.name not in d or f.name in ("watchlist", "broker_options", "sound_events"):
                 continue
             val = d[f.name]
             default = getattr(defaults, f.name)
@@ -178,6 +190,14 @@ class AppSettings:
                 if isinstance(v, dict):
                     opts.setdefault(k, {}).update(v)
             s.broker_options = opts
+        if isinstance(d.get("sound_events"), dict):
+            ev = _default_sound_events()
+            for k, v in d["sound_events"].items():
+                if isinstance(k, str):
+                    ev[k] = bool(v)
+            s.sound_events = ev
+        s.sound_volume = min(max(s.sound_volume, 0.0), 1.0)
+        s.order_timeout_seconds = max(s.order_timeout_seconds, 0)
         return s
 
 

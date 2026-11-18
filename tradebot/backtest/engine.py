@@ -1,37 +1,51 @@
 """Event-driven single-symbol backtester.
 
+All buy/sell rules come from :mod:`tradebot.strategy.risk` (the same helpers the live/paper
+engine uses), with the bar timestamps as "now".
+
 Execution model
 ---------------
-* Long-only, at most one position at a time (``risk.max_open_positions`` is irrelevant for a
-  single-symbol backtest).
-* Signals (``entry``/``exit`` from :func:`tradebot.strategy.engine.compute_signals`) are
-  evaluated on the CLOSE of bar t. The resulting market order is filled at the OPEN of bar
-  t+1. Signals of the last bar are never executed.
-* Fill prices include slippage: buys fill at ``open * (1 + slippage_pct/100)``, sells at
-  ``price * (1 - slippage_pct/100)``. Slippage is applied to EVERY exit (signal, stop,
-  take-profit, max-bars, end of data) – conservative.
-* Fees: ``fee_pct`` of the traded notional (fill price × quantity) per side; entry + exit
-  fee are accumulated into ``ClosedTrade.fees``.
-* Position size: :func:`tradebot.strategy.risk.position_quantity` with equity = cash at the
-  time of the fill (we are flat), so the buy incl. slippage and fee never exceeds cash.
-* Protective exits use :func:`tradebot.strategy.risk.check_exit` (the same function the
-  live engine uses) with the bar's open/high/low. They are checked on every bar while in a
-  position, starting with the entry bar itself (entry at the open, then that bar's high/low
-  may already hit SL/TP – conservative). Gaps through a level fill at the open; if stop and
-  take-profit are touched in the same bar, the stop wins. After a bar has been processed
-  and the position is still open, :func:`tradebot.strategy.risk.update_after_bar` updates the
-  highest price (trailing stop) and the holding-bar counter.
-* An exit signal on bar t closes the position at the open of t+1. If a position was closed
-  during bar t (for any reason), an entry signal on the close of bar t is ignored
-  (no re-entry on the bar of an exit).
-* A position still open after the last bar is closed at the last close (with slippage and
-  fee) with reason ``END_OF_DATA``.
-* Equity is marked to market at every bar close (cash + quantity × close); the last value
-  is the realised cash after the END_OF_DATA liquidation.
-* Buy & hold benchmark: same capital, buys at the open of the first tradable bar (the first
-  bar at which a strategy entry could have been filled, i.e. one bar after all used
-  indicators are available) incl. slippage and fee, marked to market at each close and
-  liquidated at the last close incl. slippage and fee.
+* Long-only. Several positions per symbol are possible (``max_positions_per_symbol`` > 1,
+  "DCA"); every buy is its own :class:`Position` and becomes its own ``ClosedTrade``.
+  ``can_open`` limits new positions (open_positions_total = open positions of this
+  backtest, i.e. effectively ``min(max_open_positions, max_positions_per_symbol)``), the
+  re-buy spacing ``add_position_min_drop_pct`` (checked against the fill bar's open),
+  ``cooldown_seconds`` and the loss-streak pause (``register_close`` after every closed
+  trade with ``pnl = trade.pnl``; pause end compared with bar timestamps; an indefinite
+  pause lasts until the end of the backtest).
+* Signals (``entry``/``exit``) are evaluated on the CLOSE of bar t, orders are filled at the
+  OPEN of bar t+1; "now" for the rules is the timestamp of bar t+1 (= the moment the
+  order is placed, i.e. the close time of bar t). Signals of the last bar are not executed.
+* Sizing: ``order_budget(equity, cash, invested_value, risk)`` with equity / invested value
+  marked at the signal bar's close, then ``quantity_for_budget(budget, next_open, risk)``.
+  A budget of 0 means no buy; such skipped buys are listed in ``BacktestResult.skipped``
+  (``{"time", "code", "reason"}``) with code ``min_order_value``, ``cash_reserve``, ``cash``
+  or ``max_exposure`` (the binding limit).
+* Fill prices: market buy = ``open * (1 + slippage)``; market sell = ``price * (1 - slippage)``.
+  Limit orders are assumed to fill (the multiples are validated to be marketable) and only
+  cap the slippage: limit buy = ``min(open * (1 + slippage), open * buy_price_multiple)``,
+  limit sell = ``max(price * (1 - slippage), price * sell_price_multiple)``. The sell
+  formula applies to every exit (signal, stops, take-profit, max-bars, end of data).
+* Fees: ``fee_pct`` of the traded notional per side; entry + exit fee of a position go into
+  ``ClosedTrade.fees``.
+* Protective exits: ``check_exit`` per position on every bar while it is open, starting
+  with its entry bar (entry at the open, then that bar's high/low may already hit SL/TP –
+  conservative). Gaps fill at the open, stop beats take-profit in the same bar. Break-even
+  and trailing activation work automatically via ``stop_levels``. Positions still open
+  after the bar get ``update_after_bar``.
+* An exit signal on bar t sells, at the open of t+1, every position for which
+  ``signal_exit_allowed(pos, open, risk, entry_fee)`` is True (minimum profit); the others
+  stay open. Protective exits ignore the minimum profit.
+* Conflicts: if the exit signal fires while positions are open, an entry signal on the
+  same bar is ignored. If any position was closed during bar t (protective exit or signal
+  exit at its open), an entry signal on the close of bar t is ignored (no re-entry on the
+  bar of an exit).
+* Positions still open after the last bar are sold at the last close (slippage + fee,
+  reason ``END_OF_DATA``). Equity is marked to market at every close (cash + Σ quantity ×
+  close); its last value is the cash after that liquidation.
+* Buy & hold benchmark: same capital, buys at the open of the first tradable bar (one bar
+  after all used indicators have values) incl. slippage and fee, liquidated at the last
+  close incl. slippage and fee.
 * No look-ahead: indicators/signals only use data up to the signal bar; fills only use the
   following bar's open (and, for protective exits, the current bar's high/low).
 """
@@ -66,6 +80,8 @@ class BacktestResult:
     bars_held: list[int] = field(default_factory=list)
     # per bar: True if a position was held during (part of) the bar
     in_market: pd.Series | None = None
+    # buys that were signalled and allowed but had a budget of 0: {"time", "code", "reason"}
+    skipped: list[dict] = field(default_factory=list)
 
     def trades_frame(self) -> pd.DataFrame:
         rows = []
@@ -101,6 +117,40 @@ def _resolve_start(df: pd.DataFrame, start) -> int:
     return int(df.index.searchsorted(pd.Timestamp(start)))
 
 
+def buy_fill_price(open_: float, r) -> float:
+    fill = open_ * (1 + r.slippage_pct / 100)
+    if r.buy_order_type == "limit":
+        fill = min(fill, open_ * r.buy_price_multiple)
+    return fill
+
+
+def sell_fill_price(price: float, r) -> float:
+    fill = price * (1 - r.slippage_pct / 100)
+    if r.sell_order_type == "limit":
+        fill = max(fill, price * r.sell_price_multiple)
+    return fill
+
+
+def _skip_reason(equity: float, cash: float, invested: float, r) -> tuple[str, str]:
+    """Which rule made ``order_budget`` return 0 (code, German text)."""
+    if r.position_size_mode == "fixed":
+        base = r.position_size_fixed
+    else:
+        base = equity * r.position_size_pct / 100.0
+    if r.max_order_value:
+        base = min(base, r.max_order_value)
+    free = cash - r.cash_reserve
+    room = equity * r.max_exposure_pct / 100.0 - invested
+    limit = min(base, free, room)
+    if limit == room and room < base:
+        return "max_exposure", "Maximaler investierter Anteil erreicht"
+    if limit == free and free < base:
+        if r.cash_reserve > 0:
+            return "cash_reserve", "Nicht genug freies Kapital (Cash-Reserve)"
+        return "cash", "Nicht genug freies Kapital"
+    return "min_order_value", f"Kaufbetrag unter dem Mindest-Kaufbetrag ({r.min_order_value:g})"
+
+
 def run_backtest(
     strategy: Strategy,
     df: pd.DataFrame,
@@ -130,6 +180,7 @@ def run_backtest(
     signals = full_signals.iloc[s0:]
     n = len(signals)
     index = signals.index
+    times = [_to_dt(t) for t in index]
 
     opens = signals["open"].to_numpy(dtype=float)
     highs = signals["high"].to_numpy(dtype=float)
@@ -139,74 +190,101 @@ def run_backtest(
     exit_sig = signals["exit"].to_numpy(dtype=bool)
 
     cash = initial_capital
-    pos: Position | None = None
-    entry_fee = 0.0
+    positions: list[Position] = []
+    entry_fees: dict[str, float] = {}  # position id -> entry fee
+    state = risk_mod.SymbolState()
     pending_entry = pending_exit = False
+    signal_equity = signal_invested = 0.0
     trades: list[ClosedTrade] = []
     bars_held: list[int] = []
     markers: list[dict] = []
+    skipped: list[dict] = []
+    pauses = 0
     equity = np.empty(n, dtype=float)
     in_market = np.zeros(n, dtype=bool)
 
-    def close_position(i: int, raw_price: float, reason: ExitReason, held: int) -> None:
-        nonlocal cash, pos, entry_fee
-        fill = raw_price * (1 - slip)
+    def close_position(pos: Position, i: int, raw_price: float, reason: ExitReason,
+                       held: int, register: bool = True) -> None:
+        nonlocal cash, pauses
+        fill = sell_fill_price(raw_price, r)
         exit_fee = pos.quantity * fill * fee
         cash += pos.quantity * fill - exit_fee
-        trades.append(ClosedTrade(
+        trade = ClosedTrade(
             symbol=symbol, quantity=pos.quantity, entry_price=pos.entry_price, exit_price=fill,
-            entry_time=pos.entry_time, exit_time=_to_dt(index[i]), fees=entry_fee + exit_fee,
-            exit_reason=reason, strategy=strategy.name,
-        ))
+            entry_time=pos.entry_time, exit_time=times[i],
+            fees=entry_fees.pop(pos.id, 0.0) + exit_fee, exit_reason=reason,
+            strategy=strategy.name,
+        )
+        trades.append(trade)
         bars_held.append(held)
         markers.append(_marker(index[i], "sell", fill, reason.value))
-        pos = None
-        entry_fee = 0.0
+        positions.remove(pos)
+        if register:
+            remaining = positions[-1].entry_price if positions else None
+            if risk_mod.register_close(state, trade.pnl, times[i], r, remaining):
+                pauses += 1
 
     for i in range(n):
         o, h, lo, c = opens[i], highs[i], lows[i], closes[i]
+        now = times[i]
         exited = False
 
         # 1) orders from the previous bar's close, filled at this bar's open
-        if pending_exit and pos is not None:
-            close_position(i, o, ExitReason.SIGNAL, pos.bars_held)
-            exited = True
-        elif pending_entry and pos is None:
-            qty = risk_mod.position_quantity(cash, cash, o, r)
-            if qty > 0:
-                fill = o * (1 + slip)
-                entry_fee = qty * fill * fee
-                cash -= qty * fill + entry_fee
-                if cash < 0 and cash > -1e-9 * initial_capital:  # float rounding
-                    cash = 0.0
-                pos = Position(symbol=symbol, quantity=qty, entry_price=fill,
-                               entry_time=_to_dt(index[i]), strategy=strategy.name)
-                markers.append(_marker(index[i], "buy", fill, "signal"))
+        if pending_exit:
+            for pos in list(positions):
+                if risk_mod.signal_exit_allowed(pos, o, r, entry_fees.get(pos.id)):
+                    close_position(pos, i, o, ExitReason.SIGNAL, pos.bars_held)
+                    exited = True
+        elif pending_entry:
+            ok, _why = risk_mod.can_open(state, len(positions), len(positions), o, now, r)
+            if ok:
+                budget = risk_mod.order_budget(signal_equity, cash, signal_invested, r)
+                qty = risk_mod.quantity_for_budget(budget, o, r)
+                if qty > 0:
+                    fill = buy_fill_price(o, r)
+                    efee = qty * fill * fee
+                    cash -= qty * fill + efee
+                    if cash < 0 and cash > -1e-9 * initial_capital:  # float rounding
+                        cash = 0.0
+                    pos = Position(symbol=symbol, quantity=qty, entry_price=fill,
+                                   entry_time=now, strategy=strategy.name)
+                    positions.append(pos)
+                    entry_fees[pos.id] = efee
+                    risk_mod.register_buy(state, fill, now)
+                    markers.append(_marker(index[i], "buy", fill, "signal"))
+                else:
+                    code, reason = _skip_reason(signal_equity, cash, signal_invested, r)
+                    skipped.append({"time": now, "code": code, "reason": reason})
         pending_entry = pending_exit = False
 
-        # 2) protective exits within this bar (incl. the entry bar)
-        if pos is not None:
+        # 2) protective exits within this bar (incl. the entry bar), 3) bar bookkeeping
+        if positions:
             in_market[i] = True
+        for pos in list(positions):
             hit = risk_mod.check_exit(pos, r, o, h, lo)
             if hit is not None:
                 reason, price = hit
-                close_position(i, price, reason, pos.bars_held + 1)
+                close_position(pos, i, price, reason, pos.bars_held + 1)
                 exited = True
             else:
                 risk_mod.update_after_bar(pos, h)
 
-        # 3) mark to market at the close
-        equity[i] = cash + (pos.quantity * c if pos is not None else 0.0)
+        # 4) mark to market at the close
+        invested = sum(p.quantity * c for p in positions)
+        equity[i] = cash + invested
 
-        # 4) signals at this close -> orders for the next bar's open
+        # 5) signals at this close -> orders for the next bar's open
         if i < n - 1:
-            if pos is not None:
-                pending_exit = bool(exit_sig[i])
-            elif not exited:
-                pending_entry = bool(entry_sig[i])
+            if positions and exit_sig[i]:
+                pending_exit = True
+            elif entry_sig[i] and not exited:
+                pending_entry = True
+                signal_equity, signal_invested = equity[i], invested
 
-    if pos is not None:
-        close_position(n - 1, closes[-1], ExitReason.END_OF_DATA, pos.bars_held)
+    for pos in list(positions):
+        close_position(pos, n - 1, closes[-1], ExitReason.END_OF_DATA, pos.bars_held,
+                       register=False)
+    if trades and trades[-1].exit_reason == ExitReason.END_OF_DATA:
         equity[-1] = cash
 
     equity_s = pd.Series(equity, index=index, name="equity")
@@ -224,8 +302,7 @@ def run_backtest(
     if b < n:
         bh_qty = initial_capital / (opens[b] * (1 + slip) * (1 + fee))
         bh[b:] = bh_qty * closes[b:]
-        last_fill = closes[-1] * (1 - slip)
-        bh[-1] = bh_qty * last_fill * (1 - fee)
+        bh[-1] = bh_qty * closes[-1] * (1 - slip) * (1 - fee)
     buy_hold = pd.Series(bh, index=index, name="buy_hold")
 
     metrics = compute_metrics(equity_s, trades, buy_hold, strategy.timeframe, initial_capital,
@@ -249,11 +326,19 @@ def run_backtest(
             f"Nur {len(trades)} Trade{'s' if len(trades) != 1 else ''} – das Ergebnis ist "
             f"statistisch kaum aussagekräftig (empfohlen: mindestens {MIN_TRADES_MEANINGFUL})."
         )
+    n_min = sum(1 for x in skipped if x["code"] == "min_order_value")
+    if n_min and (n_min >= 3 or not trades):
+        warnings.append(
+            f"{n_min} Käufe wurden übersprungen, weil der Kaufbetrag unter dem Mindest-Kaufbetrag "
+            f"({r.min_order_value:g}) lag – Startkapital oder Positionsgröße erhöhen."
+        )
+    if pauses:
+        warnings.append(f"Das Symbol wurde {pauses}× wegen einer Verlust-Serie pausiert.")
     if fee == 0 and slip == 0:
         warnings.append("Gebühren und Slippage sind 0 – das Ergebnis ist vermutlich zu optimistisch.")
 
     return BacktestResult(
         trades=trades, equity=equity_s, buy_hold=buy_hold, signals=signals, metrics=metrics,
         markers=markers, strategy=strategy, symbol=symbol, warnings=warnings,
-        bars_held=bars_held, in_market=in_market_s,
+        bars_held=bars_held, in_market=in_market_s, skipped=skipped,
     )
