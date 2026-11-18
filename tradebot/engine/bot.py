@@ -418,8 +418,8 @@ class TradingBot:
     async def start(self) -> None:
         if self._running:
             return
+        self.settings = self.store.load()
         await self._preflight()
-        self.settings = self.store.load() if self.store else self.settings
         self._running = True
         self._killed = False
         self.started_at = self.clock()

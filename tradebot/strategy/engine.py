@@ -81,6 +81,11 @@ def _fmt_num(v) -> str:
         return str(v)
 
 
+def _fmt_de(v) -> str:
+    """Number in German notation (decimal comma) for prose."""
+    return _fmt_num(v).replace(".", ",")
+
+
 # --------------------------------------------------------------------------- analysis
 def required_indicators(strategy: Strategy) -> list[tuple[str, dict]]:
     """Unique (indicator key, normalized params) pairs used by the strategy."""
@@ -344,7 +349,7 @@ def validate(strategy: Strategy) -> list[str]:
 # --------------------------------------------------------------------------- description
 def describe_operand(op: Operand) -> str:
     if op.kind == "value":
-        text = _fmt_num(op.value) if op.value is not None else "?"
+        text = _fmt_de(op.value) if op.value is not None else "?"
     elif op.kind == "price":
         text = PRICE_FIELD_LABELS.get(op.field, op.field)
     elif op.kind == "indicator":
@@ -395,15 +400,15 @@ def describe_strategy(strategy: Strategy) -> str:
     group_text(strategy.exit, "Verkaufen")
 
     r = strategy.risk
-    risk = [f"Positionsgröße {_fmt_num(r.position_size_pct)} % des Kapitals"]
+    risk = [f"Positionsgröße {_fmt_de(r.position_size_pct)} % des Kapitals"]
     if r.take_profit_pct:
-        risk.append(f"Take-Profit {_fmt_num(r.take_profit_pct)} %")
+        risk.append(f"Take-Profit {_fmt_de(r.take_profit_pct)} %")
     if r.stop_loss_pct:
-        risk.append(f"Stop-Loss {_fmt_num(r.stop_loss_pct)} %")
+        risk.append(f"Stop-Loss {_fmt_de(r.stop_loss_pct)} %")
     if r.trailing_stop_pct:
-        risk.append(f"Trailing-Stop {_fmt_num(r.trailing_stop_pct)} %")
+        risk.append(f"Trailing-Stop {_fmt_de(r.trailing_stop_pct)} %")
     if r.max_holding_bars:
         risk.append(f"max. Haltedauer {int(r.max_holding_bars)} Kerzen")
-    risk.append(f"Gebühr {_fmt_num(r.fee_pct)} % / Slippage {_fmt_num(r.slippage_pct)} % je Seite")
+    risk.append(f"Gebühr {_fmt_de(r.fee_pct)} % / Slippage {_fmt_de(r.slippage_pct)} % je Seite")
     lines.append("Risiko: " + ", ".join(risk))
     return "\n".join(lines)
