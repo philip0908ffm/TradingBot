@@ -92,7 +92,12 @@ class GuiState:
         if bot is None or id(bot) in self._subscribed:
             return
         self._subscribed.add(id(bot))
-        bot.subscribe(lambda ev, m=mode: self.feed.publish_bot_event(m, ev))
+        # BotManager.start() copies the subscribers of the previous bot – don't subscribe twice
+        if any(getattr(cb, "_tb_feed", False) for cb in getattr(bot, "_subscribers", [])):
+            return
+        cb = lambda ev, m=mode: self.feed.publish_bot_event(m, ev)  # noqa: E731
+        cb._tb_feed = True
+        bot.subscribe(cb)
 
 
 _state: GuiState | None = None
