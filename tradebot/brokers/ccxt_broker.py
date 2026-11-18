@@ -271,6 +271,7 @@ class CcxtBroker(Broker):
         quantity: float,
         order_type: OrderType = OrderType.MARKET,
         price: float | None = None,
+        client_order_id: str | None = None,
     ) -> Order:
         self._require_credentials()
         side = Side(side)
@@ -288,7 +289,10 @@ class CcxtBroker(Broker):
                 req_price = float(self.exchange.price_to_precision(symbol, price))
             except Exception as exc:  # noqa: BLE001
                 raise translate_ccxt_error(exc, self.display_name) from exc
-        res = self._call("create_order", symbol, order_type.value, side.value, qty, req_price)
+        args = [symbol, order_type.value, side.value, qty, req_price]
+        if client_order_id:
+            args.append(self._client_id_params(client_order_id))
+        res = self._call("create_order", *args)
         # Some exchanges return only an id; fetch the full order once if fill info is missing.
         if res and res.get("id") and res.get("filled") is None and res.get("status") is None:
             try:
@@ -304,6 +308,69 @@ class CcxtBroker(Broker):
     def fetch_order(self, order_id: str, symbol: str) -> Order:
         self._require_credentials()
         res = self._call("fetch_order", order_id, symbol) or {}
+        side = Side(str(res.get("side") or "buy").lower())
+        otype = OrderType.LIMIT if str(res.get("type") or "").lower() == "limit" else OrderType.MARKET
+        qty = float(res.get("amount") or 0.0)
+        price = float(res["price"]) if res.get("price") else None
+        return self._map_order(res, symbol, side, qty, otype, price)
+
+    # ---- client order ids -----------------------------------------------------------
+    def _client_id_params(self, client_order_id: str) -> dict:
+        """Exchange specific params carrying our client order id."""
+        if self.exchange_id == "binance":
+            return {"newClientOrderId": client_order_id}
+        if self.exchange_id == "kraken":
+            return {"userref": self._userref(client_order_id)}
+        return {"clientOrderId": client_order_id}
+
+    @staticmethod
+    def _userref(client_order_id: str) -> int:
+        """Kraken only accepts a signed 32-bit integer reference."""
+        import zlib
+
+        return zlib.crc32(client_order_id.encode("utf-8")) & 0x7FFFFFFF
+
+    def _matches_client_id(self, res: dict, client_order_id: str) -> bool:
+        if not res:
+            return False
+        if res.get("clientOrderId") == client_order_id:
+            return True
+        info = res.get("info") or {}
+        if self.exchange_id == "kraken":
+            ref = info.get("userref") if isinstance(info, dict) else None
+            try:
+                return ref is not None and int(ref) == self._userref(client_order_id)
+            except (TypeError, ValueError):
+                return False
+        return isinstance(info, dict) and client_order_id in (
+            info.get("clientOrderId"), info.get("origClientOrderId"), info.get("newClientOrderId"))
+
+    def fetch_order_by_client_id(self, client_order_id: str, symbol: str) -> Order | None:
+        self._require_credentials()
+        res = None
+        if self.exchange_id == "binance":
+            try:
+                res = self._call("fetch_order", None, symbol, {"origClientOrderId": client_order_id})
+            except BrokerError as exc:
+                if "nicht gefunden" in str(exc):
+                    return None
+                raise
+        else:
+            candidates: list = []
+            has = getattr(self.exchange, "has", None) or {}
+            for method, cap in (("fetch_open_orders", "fetchOpenOrders"),
+                                ("fetch_closed_orders", "fetchClosedOrders")):
+                if has.get(cap) is False:
+                    continue
+                try:
+                    candidates += self._call(method, symbol, None, 100) or []
+                except NotSupportedError:
+                    continue
+            res = next((r for r in candidates if self._matches_client_id(r, client_order_id)), None)
+            if res is None:
+                return None
+        if not res:
+            return None
         side = Side(str(res.get("side") or "buy").lower())
         otype = OrderType.LIMIT if str(res.get("type") or "").lower() == "limit" else OrderType.MARKET
         qty = float(res.get("amount") or 0.0)
@@ -330,6 +397,10 @@ class CcxtBroker(Broker):
         quote = self._quote_of(symbol)
         base = self._base_of(symbol)
         fee = self._fee_in_quote(res, base, quote, avg)
+        fee_base = self._fee_in_base(res, base)
+        if fee_base:
+            res = dict(res)
+            res["fee_base"] = fee_base
 
         created = datetime.now(timezone.utc)
         if res.get("timestamp"):
@@ -355,6 +426,16 @@ class CcxtBroker(Broker):
 
     def _base_of(self, symbol: str) -> str:
         return symbol.split("/")[0]
+
+    @staticmethod
+    def _fee_in_base(res: dict, base: str) -> float:
+        """Base-asset quantity withheld as fee (e.g. Binance without BNB discount)."""
+        fees = res.get("fees") or ([res["fee"]] if res.get("fee") else [])
+        total = 0.0
+        for f in fees:
+            if f and f.get("currency") == base and f.get("cost") not in (None, ""):
+                total += float(f["cost"])
+        return total
 
     def _fee_in_quote(self, res: dict, base: str, quote: str, avg: float | None) -> float:
         fees = res.get("fees") or ([res["fee"]] if res.get("fee") else [])

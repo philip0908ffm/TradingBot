@@ -291,6 +291,7 @@ class AlpacaBroker(Broker):
         quantity: float,
         order_type: OrderType = OrderType.MARKET,
         price: float | None = None,
+        client_order_id: str | None = None,
     ) -> Order:
         side = Side(side)
         order_type = OrderType(order_type)
@@ -300,13 +301,14 @@ class AlpacaBroker(Broker):
         a_side = OrderSide.BUY if side == Side.BUY else OrderSide.SELL
         if order_type == OrderType.MARKET:
             req = self._wrap(MarketOrderRequest, symbol=symbol, qty=qty, side=a_side,
-                             time_in_force=TimeInForce.DAY)
+                             time_in_force=TimeInForce.DAY, client_order_id=client_order_id)
         else:
             if not price or price <= 0:
                 raise InvalidOrderError("Limit-Order benötigt einen gültigen Limitpreis.")
             limit_price = round(float(price), 2 if price >= 1 else 4)
             req = self._wrap(LimitOrderRequest, symbol=symbol, qty=qty, side=a_side,
-                             time_in_force=TimeInForce.DAY, limit_price=limit_price)
+                             time_in_force=TimeInForce.DAY, limit_price=limit_price,
+                             client_order_id=client_order_id)
         res = self._wrap(self.trading_client.submit_order, req)
         if order_type == OrderType.MARKET and self.fill_timeout > 0:
             res = self._wait_for_fill(res)
@@ -355,6 +357,18 @@ class AlpacaBroker(Broker):
 
     def fetch_order(self, order_id: str, symbol: str) -> Order:
         res = self._wrap(self.trading_client.get_order_by_id, order_id)
+        side = Side.SELL if _enum_value(getattr(res, "side", "buy")) == "sell" else Side.BUY
+        otype_raw = _enum_value(getattr(res, "order_type", None) or getattr(res, "type", None))
+        otype = OrderType.LIMIT if otype_raw == "limit" else OrderType.MARKET
+        qty = float(getattr(res, "qty", None) or 0.0)
+        return self._map_order(res, getattr(res, "symbol", None) or symbol, side, qty, otype, None)
+
+    def fetch_order_by_client_id(self, client_order_id: str, symbol: str) -> Order | None:
+        """Look up an order by our client order id; None if Alpaca has no such order."""
+        try:
+            res = self._wrap(self.trading_client.get_order_by_client_id, client_order_id)
+        except BadSymbolError:  # 404 -> the order was never created
+            return None
         side = Side.SELL if _enum_value(getattr(res, "side", "buy")) == "sell" else Side.BUY
         otype_raw = _enum_value(getattr(res, "order_type", None) or getattr(res, "type", None))
         otype = OrderType.LIMIT if otype_raw == "limit" else OrderType.MARKET

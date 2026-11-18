@@ -34,6 +34,7 @@ class FakeBroker(Broker):
         self.prices: dict[str, float] = {}
         self.candles: dict[str, pd.DataFrame] = {}
         self.fail: set[str] = set()
+        self.fail_ohlcv: set[str] = set()
         self.orders: list[Order] = []
 
     def info(self):  # instance-level override of the classmethod
@@ -43,7 +44,7 @@ class FakeBroker(Broker):
                           quote_currency=self.quote)
 
     def fetch_ohlcv(self, symbol, timeframe, start=None, end=None, limit=None):
-        if symbol in self.fail:
+        if symbol in self.fail or symbol in self.fail_ohlcv:
             raise BrokerError("Netzwerkfehler")
         df = self.candles[symbol]
         return df.iloc[-limit:] if limit else df
@@ -235,14 +236,21 @@ def test_one_symbol_error_does_not_stop_others(store, sig):
     run(bot.run_once())
     assert [p.symbol for p in bot.journal.positions.values()] == ["ETH/USDT"]
     assert any(e.level == "error" and e.symbol == "BTC/USDT" for e in bot.events)
-    # backoff: second error doubles the wait
+    # price failures are retried every loop (stop-losses must never wait for a backoff)
+    assert "fake:BTC/USDT" not in bot._errors and bot._tick_errors["BTC/USDT"] == 1
+    # candle/signal failures use backoff: second error doubles the wait
+    fake.fail = set()
+    fake.fail_ohlcv.add("BTC/USDT")
+    clock.now += timedelta(seconds=60)
+    run(bot.run_once())
+    assert bot._errors["fake:BTC/USDT"][0] == 1
     clock.now += timedelta(seconds=1)
     run(bot.run_once())
     assert bot._errors["fake:BTC/USDT"][0] == 2
     clock.now += timedelta(seconds=1)  # still within backoff -> skipped
     run(bot.run_once())
     assert bot._errors["fake:BTC/USDT"][0] == 2
-    fake.fail.clear()
+    fake.fail_ohlcv.clear()
     clock.now += timedelta(seconds=5)
     run(bot.run_once())
     assert "fake:BTC/USDT" not in bot._errors
@@ -376,14 +384,20 @@ def test_live_sell_limited_to_free_balance(store, sig):
 
 
 def test_kill_switch(store, sig):
-    enable_live(store, live_daily_loss_limit_pct=5.0)
-    bot, fake, clock = setup(store, mode=TradingMode.LIVE)
+    enable_live(store, live_daily_loss_limit_pct=5.0, live_max_order_value=100000.0)
+    bot, fake, clock = setup(store, mode=TradingMode.LIVE, position_size_pct=50, stop_loss_pct=None)
+    sig.entry.add(pd.Timestamp(CLOSED))
 
     async def go():
         await bot.start()
-        await asyncio.sleep(0.05)  # first iteration sets daily start equity
+        await asyncio.sleep(0.05)  # first iteration: buys ~50 % and sets the daily baseline
+        assert bot.running and bot.journal.positions
+        fake.cash -= 600  # money moved out by the user: NOT a bot loss -> no kill switch
+        clock.now += timedelta(seconds=1)
+        bot._wake.set()
+        await asyncio.sleep(0.05)
         assert bot.running
-        fake.cash -= 600  # equity drops 6 %
+        fake.prices["BTC/USDT"] = 85.0  # bot position -15 % of ~5000 = -750 (~7.5 %)
         clock.now += timedelta(seconds=1)
         bot._wake.set()
         for _ in range(100):
@@ -394,6 +408,7 @@ def test_kill_switch(store, sig):
         await bot.stop()
     run(go())
     assert any("NOTSCHALTER" in e.message for e in bot.events)
+    assert any(e.kind == "kill_switch" for e in bot.events)
     assert bot.status()["kill_switch"] is True
     bot2, _, _ = setup(store, mode=TradingMode.LIVE, clock=clock)
     with pytest.raises(BotError, match="Notschalter"):

@@ -131,6 +131,13 @@ class PaperAccount:
         with self._lock:
             return self.holdings.get(symbol, 0.0)
 
+    def find_order_by_client_id(self, client_order_id: str) -> dict | None:
+        with self._lock:
+            for d in reversed(self.orders):
+                if d.get("client_order_id") == client_order_id:
+                    return dict(d)
+        return None
+
     def find_order(self, order_id: str) -> dict | None:
         with self._lock:
             for d in reversed(self.orders):
@@ -167,7 +174,11 @@ class PaperAccount:
                 else:
                     self.holdings[order.symbol] = rest
                 self.cash += notional - order.fee
-            self.orders.append(order.to_dict())
+            d = order.to_dict()
+            cid = (order.raw or {}).get("client_order_id") if isinstance(order.raw, dict) else None
+            if cid:
+                d["client_order_id"] = cid
+            self.orders.append(d)
             if len(self.orders) > self.max_history:
                 del self.orders[: len(self.orders) - self.max_history]
             self.save()
@@ -238,6 +249,7 @@ class PaperBroker(Broker):
         quantity: float,
         order_type: OrderType = OrderType.MARKET,
         price: float | None = None,
+        client_order_id: str | None = None,
     ) -> Order:
         side = Side(side)
         order_type = OrderType(order_type)
@@ -277,7 +289,8 @@ class PaperBroker(Broker):
             filled_quantity=qty,
             fee=fee,
             created_at=utcnow(),
-            raw={"paper": True, "market_price": market, "limit_price": price},
+            raw={"paper": True, "market_price": market, "limit_price": price,
+                 "client_order_id": client_order_id},
         )
         self.account.apply_fill(order)
         return order
@@ -287,6 +300,10 @@ class PaperBroker(Broker):
         if d is None:
             raise BrokerError(f"Papierhandel: Order {order_id} nicht gefunden.")
         return order_from_dict(d)
+
+    def fetch_order_by_client_id(self, client_order_id: str, symbol: str) -> Order | None:
+        d = self.account.find_order_by_client_id(client_order_id)
+        return order_from_dict(d) if d is not None else None
 
     def cancel_order(self, order_id: str, symbol: str) -> None:
         """Paper orders fill immediately, so there is never an open remainder to cancel.

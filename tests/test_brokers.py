@@ -666,3 +666,20 @@ def test_paper_marketable_limit_fills_and_fetch_order(tmp_path):
     assert again.fetch_order(sell.id, "BTC/USDT").price == pytest.approx(99.95)
     with pytest.raises(BrokerError, match="nicht gefunden"):
         pb.fetch_order("missing", "BTC/USDT")
+
+
+def test_alpaca_client_order_id_roundtrip():
+    from tradebot.brokers.base import BadSymbolError
+
+    b = make_alpaca()
+    b._trading_client.get_order_by_client_id.side_effect = BadSymbolError("nicht gefunden")
+    assert b.fetch_order_by_client_id("tb123", "AAPL") is None
+    b._trading_client.get_order_by_client_id.side_effect = None
+    b._trading_client.get_order_by_client_id.return_value = MagicMock(
+        id="o1", symbol="AAPL", side="buy", order_type="market", qty="2", filled_qty="2",
+        filled_avg_price="100", status="filled", submitted_at=None, limit_price=None)
+    o = b.fetch_order_by_client_id("tb123", "AAPL")
+    assert o.filled_quantity == 2 and o.price == 100
+    b.place_order("AAPL", "buy", 1, client_order_id="tb999")
+    req = b._trading_client.submit_order.call_args[0][0]
+    assert req.client_order_id == "tb999"

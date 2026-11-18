@@ -201,6 +201,10 @@ class AppSettings:
         return s
 
 
+class CredentialsError(Exception):
+    """Stored credentials cannot be decrypted (German message). Nothing is overwritten."""
+
+
 class SettingsStore:
     """Persistent storage for settings, credentials and strategies."""
 
@@ -265,6 +269,12 @@ class SettingsStore:
         kp = self.key_path
         if kp.exists():
             key = kp.read_bytes().strip()
+        elif self.credentials_path.exists():
+            # never create a new key for an existing credentials file (would lose all keys)
+            raise CredentialsError(
+                "Der Schlüssel (.key) für die gespeicherten Zugangsdaten fehlt. "
+                f"Bitte die Datei '{kp.name}' wiederherstellen oder '{self.credentials_path.name}' "
+                "löschen und alle Zugangsdaten neu eingeben.")
         else:
             key = Fernet.generate_key()
             atomic_write_bytes(kp, key, mode=0o600)
@@ -282,13 +292,18 @@ class SettingsStore:
         try:
             raw = self._fernet().decrypt(p.read_bytes())
             data = json.loads(raw.decode("utf-8"))
-            return data if isinstance(data, dict) else {}
-        except InvalidToken:
-            log.error("Zugangsdaten konnten nicht entschlüsselt werden (Schlüssel passt nicht)")
-            return {}
+        except InvalidToken as exc:
+            raise CredentialsError(
+                "Die gespeicherten Zugangsdaten können nicht entschlüsselt werden (Schlüssel "
+                "passt nicht). Es wurde nichts überschrieben – bitte die passende Datei "
+                f"'{self.key_path.name}' wiederherstellen oder '{p.name}' löschen.") from exc
         except (OSError, ValueError) as exc:
-            log.error("Zugangsdaten konnten nicht gelesen werden: %s", type(exc).__name__)
-            return {}
+            raise CredentialsError(
+                f"Die gespeicherten Zugangsdaten sind beschädigt ({type(exc).__name__}). "
+                f"Es wurde nichts überschrieben – bitte '{p.name}' prüfen oder löschen.") from exc
+        if not isinstance(data, dict):
+            raise CredentialsError("Die gespeicherten Zugangsdaten haben ein ungültiges Format.")
+        return data
 
     def _write_all_credentials(self, data: dict[str, dict]) -> None:
         token = self._fernet().encrypt(json.dumps(data).encode("utf-8"))
@@ -314,7 +329,20 @@ class SettingsStore:
             log.info("Zugangsdaten für %s gelöscht", broker)
 
     def has_credentials(self, broker: str) -> bool:
-        return bool(self._read_all_credentials().get(broker))
+        """False also when the credentials file is unreadable (see ``credentials_error``)."""
+        try:
+            return bool(self._read_all_credentials().get(broker))
+        except CredentialsError as exc:
+            log.error("%s", exc)
+            return False
+
+    def credentials_error(self) -> str | None:
+        """German error message if stored credentials are unreadable, else None."""
+        try:
+            self._read_all_credentials()
+        except CredentialsError as exc:
+            return str(exc)
+        return None
 
     # ---- strategies -------------------------------------------------------------------
     def _strategy_path(self, name: str) -> Path:

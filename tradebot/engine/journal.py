@@ -30,6 +30,10 @@ class TradeJournal:
         self.position_brokers: dict[str, str] = {}  # position id -> broker key
         self.entry_fees: dict[str, float] = {}  # position id -> entry fee (quote)
         self.external_closed: set[str] = set()  # position ids no longer held at the broker
+        self.dust: set[str] = set()  # position ids too small to sell (below lot/notional)
+        self.position_envs: dict[str, str] = {}  # position id -> broker environment
+        # client order id -> pending/uncertain order (write-ahead before place_order)
+        self.pending_orders: dict[str, dict] = {}
         self.symbol_states: dict[str, SymbolState] = {}  # symbol -> buy-rule state
         self.closed_trades: list[ClosedTrade] = []
         self.last_candle: dict[str, str] = {}  # "broker:symbol" -> iso ts of last processed candle
@@ -68,6 +72,10 @@ class TradeJournal:
         self.position_brokers = brokers
         self.entry_fees = {k: float(v) for k, v in (d.get("entry_fees") or {}).items()}
         self.external_closed = {i for i in d.get("external_closed") or [] if i in positions}
+        self.dust = {i for i in d.get("dust") or [] if i in positions}
+        self.position_envs = {k: str(v) for k, v in (d.get("position_envs") or {}).items() if k in positions}
+        self.pending_orders = {k: dict(v) for k, v in (d.get("pending_orders") or {}).items()
+                               if isinstance(v, dict)}
         states = {}
         for sym, raw in (d.get("symbol_states") or {}).items():
             try:
@@ -97,6 +105,9 @@ class TradeJournal:
             "position_brokers": self.position_brokers,
             "entry_fees": self.entry_fees,
             "external_closed": sorted(self.external_closed),
+            "dust": sorted(self.dust),
+            "position_envs": self.position_envs,
+            "pending_orders": self.pending_orders,
             "symbol_states": {s: st.to_dict() for s, st in self.symbol_states.items()},
             "closed_trades": [t.to_dict() for t in self.closed_trades],
             "last_candle": self.last_candle,
@@ -116,6 +127,9 @@ class TradeJournal:
         self.position_brokers.clear()
         self.entry_fees.clear()
         self.external_closed.clear()
+        self.dust.clear()
+        self.position_envs.clear()
+        self.pending_orders.clear()
         self.symbol_states.clear()
         self.closed_trades.clear()
         self.last_candle.clear()
@@ -140,16 +154,20 @@ class TradeJournal:
         return st
 
     # ---- mutations --------------------------------------------------------------------
-    def open_position(self, pos: Position, broker: str, entry_fee: float) -> None:
+    def open_position(self, pos: Position, broker: str, entry_fee: float, env: str | None = None) -> None:
         self.positions[pos.id] = pos
         self.position_brokers[pos.id] = broker
         self.entry_fees[pos.id] = float(entry_fee)
+        if env:
+            self.position_envs[pos.id] = env
 
     def remove_position(self, pos_id: str) -> Position | None:
         pos = self.positions.pop(pos_id, None)
         self.position_brokers.pop(pos_id, None)
         self.entry_fees.pop(pos_id, None)
         self.external_closed.discard(pos_id)
+        self.dust.discard(pos_id)
+        self.position_envs.pop(pos_id, None)
         return pos
 
     def close_position(self, pos_id: str, trade: ClosedTrade) -> None:
@@ -175,9 +193,23 @@ class TradeJournal:
         if len(self.equity_history) > MAX_EQUITY_POINTS:
             del self.equity_history[: len(self.equity_history) - MAX_EQUITY_POINTS]
 
-    def ensure_daily_start(self, today: date, equity: float) -> float:
-        """Return the start equity of ``today`` (UTC), initialising it on a new day."""
+    def ensure_daily_start(self, today: date, equity: float, pnl_mark: float | None = None) -> float:
+        """Return the start equity of ``today`` (UTC), initialising it on a new day.
+
+        ``pnl_mark`` = the bot's own P&L mark (realized + unrealized) at the start of the day;
+        the kill switch compares against it.
+        """
         key = today.isoformat()
         if not self.daily_start or self.daily_start.get("date") != key:
             self.daily_start = {"date": key, "equity": float(equity)}
+        if pnl_mark is not None and self.daily_start.get("pnl_mark") is None:
+            self.daily_start["pnl_mark"] = float(pnl_mark)
         return float(self.daily_start["equity"])
+
+    def pending_for_position(self, pos_id: str) -> dict | None:
+        return next((o for o in self.pending_orders.values() if o.get("position_id") == pos_id), None)
+
+    def pending_buy_for(self, symbol: str, broker: str) -> dict | None:
+        return next((o for o in self.pending_orders.values()
+                     if o.get("side") == "buy" and o.get("symbol") == symbol
+                     and o.get("broker") == broker), None)

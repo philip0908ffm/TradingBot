@@ -217,6 +217,14 @@ class WalletPanel:
                     tc.badge(tc.broker_name(r.get("broker")))
                     if r.get("external_closed"):
                         tc.badge("extern geschlossen", "warn")
+                    if r.get("dust"):
+                        tc.badge("Restmenge (nicht handelbar)", "warn")
+                    if r.get("uncertain"):
+                        tc.badge("Orderstatus unklar", "neg")
+                    elif r.get("pending_order"):
+                        tc.badge("Order offen", "warn")
+                    if r.get("env_mismatch"):
+                        tc.badge("andere Umgebung (Testnet?)", "neg")
 
         def entry(r):
             with ui.column().classes("gap-0 items-end"):
@@ -255,7 +263,10 @@ class WalletPanel:
             return fmt_price(r.get("current_price"))
 
         def action(r):
-            if r.get("external_closed"):
+            if r.get("uncertain") and r.get("pending_cid"):
+                ui.button("Order geklärt", icon="task_alt",
+                          on_click=lambda _, p=r: self.open_clear_pending(p)).props("flat dense size=sm color=negative")
+            elif r.get("external_closed") or r.get("dust"):
                 ui.button("Aus Journal entfernen", icon="delete_outline",
                           on_click=lambda _, p=r: self.open_forget(p)).props("flat dense size=sm color=warning")
             else:
@@ -275,7 +286,8 @@ class WalletPanel:
                    "Geschätzter Erlös nach Gebühren und Slippage – und das daraus folgende Netto-Ergebnis"),
             tc.Col("", action, "r"),
         ], positions, empty="Keine offenen Bot-Positionen.",
-            row_class=lambda r: "tb-row-warn" if r.get("external_closed") else "")
+            row_class=lambda r: "tb-row-warn" if (r.get("external_closed") or r.get("dust")
+                                                  or r.get("uncertain")) else "")
 
     def _holdings(self, holdings: dict) -> None:
         with card("gap-2"):
@@ -400,10 +412,33 @@ class WalletPanel:
                                     danger=self.live)
         dlg.open()
 
+    def open_clear_pending(self, p: dict) -> None:
+        def body() -> None:
+            ui.label(f"Für {p.get('symbol')} konnte der Status einer Order nicht ermittelt werden "
+                     "(z. B. Verbindungsabbruch). Der Bot handelt dieses Symbol nicht, bis das geklärt ist. "
+                     "Prüfe die Order direkt beim Broker (Order-Historie). Bestätige erst dann. Danach "
+                     "behandelt der Bot die Position wieder normal. Falls die Order ausgeführt wurde, "
+                     "entferne die Position anschließend über 'Aus Journal entfernen'.").classes("text-sm")
+            ui.label(f"Client-Order-ID: {p.get('pending_cid')}").classes("tb-muted text-xs font-mono")
+
+        async def ok() -> None:
+            try:
+                await self.mgr.clear_pending_order(self.mode, p["pending_cid"])
+                ui.notify("Order als geklärt markiert", color="warning", position="bottom-right")
+            except Exception as exc:  # noqa: BLE001
+                ui.notify(f"Fehlgeschlagen: {exc}", color="negative", position="bottom-right")
+            await self.refresh()
+
+        with self.dialog_host:
+            self.dialog_host.clear()
+            dlg = tc.confirm_dialog("Unklare Order als geklärt markieren?", body, "Geklärt", "warning", ok)
+        dlg.open()
+
     def open_forget(self, p: dict) -> None:
         def body() -> None:
-            ui.label(f"Die Position {p.get('symbol')} ({tc.fmt_qty(p.get('quantity'))}) ist beim Broker nicht "
-                     "mehr vorhanden. Entferne sie nur, wenn du sicher bist, dass sie außerhalb des Bots "
+            reason = ("ist kleiner als die Mindest-Ordergröße des Brokers und kann nicht verkauft werden"
+                      if p.get("dust") else "ist beim Broker nicht mehr vorhanden")
+            ui.label(f"Die Position {p.get('symbol')} ({tc.fmt_qty(p.get('quantity'))}) {reason}. Entferne sie nur, wenn du sicher bist, dass sie außerhalb des Bots "
                      "verkauft wurde. Es wird keine Order gesendet.").classes("text-sm")
 
         async def ok() -> None:

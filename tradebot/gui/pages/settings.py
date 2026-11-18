@@ -535,18 +535,8 @@ def general_tab() -> None:
 # =========================================================================================
 
 def _reset_kill_switch() -> None:
-    st = state()
-    bot = st.manager.get(TradingMode.LIVE)
-    if bot is not None and bot.running and hasattr(bot, "reset_kill_switch"):
-        bot.reset_kill_switch()
-        return
-    from tradebot.engine.bot import journal_path
-    from tradebot.engine.journal import TradeJournal
-
-    j = TradeJournal(journal_path(st.store, TradingMode.LIVE))
-    j.kill_switch_date = None
-    j.daily_start = None
-    j.save()
+    # goes through the manager's single LIVE bot object so its in-memory journal stays consistent
+    state().manager.reset_kill_switch(TradingMode.LIVE)
 
 
 def live_tab() -> None:
