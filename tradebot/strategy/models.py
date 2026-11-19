@@ -65,32 +65,70 @@ class Condition:
         return cls(Operand.from_dict(d["left"]), d["op"], Operand.from_dict(d["right"]))
 
 
+LOGIC = {"all": "alle Bedingungen", "any": "mindestens eine Bedingung",
+         "min": "Mindestanteil der Bedingungen"}
+
+
 @dataclass
 class RuleGroup:
-    logic: str = "all"  # "all" (AND) | "any" (OR)
+    logic: str = "all"  # "all" (AND) | "any" (OR) | "min" (at least min_true_pct % of conditions)
     conditions: list[Condition] = field(default_factory=list)
+    min_true_pct: float = 50.0  # only used when logic == "min" ("Mindest-Signalstärke")
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "RuleGroup":
         if not d:
             return cls()
-        return cls(d.get("logic", "all"), [Condition.from_dict(c) for c in d.get("conditions", [])])
+        return cls(d.get("logic", "all"), [Condition.from_dict(c) for c in d.get("conditions", [])],
+                   float(d.get("min_true_pct", 50.0)))
 
 
 @dataclass
 class RiskSettings:
+    """Trading settings ("Trading-Einstellungen") of a strategy.
+
+    Used identically by backtest, TEST (paper) and LIVE mode via ``tradebot.strategy.risk``.
+    Money values are in the quote currency of the instrument (USDT, USD, EUR...).
+    """
+
+    # ---- Buying -------------------------------------------------------------------
+    position_size_mode: str = "pct"  # "pct" (% of equity) | "fixed" (fixed amount)
     position_size_pct: float = 10.0  # % of current equity per new position
+    position_size_fixed: float = 100.0  # amount per new position when mode == "fixed"
+    min_order_value: float = 10.0  # skip buys below this amount
+    max_order_value: float | None = None  # cap per buy (None = no cap)
+    max_open_positions: int = 5  # total across all symbols of one bot
+    max_positions_per_symbol: int = 1  # >1 allows adding to a position (DCA)
+    add_position_min_drop_pct: float = 3.0  # extra buy only if price is x% below last entry
+    cooldown_seconds: int = 0  # wait after a buy before buying the same symbol again
+    max_loss_streak: int = 0  # pause a symbol after N losing trades in a row (0 = off)
+    loss_streak_pause_hours: float = 24.0  # pause length (0 = until bot restart / manual reset)
+    max_exposure_pct: float = 100.0  # max % of equity invested at the same time
+    cash_reserve: float = 0.0  # amount that is never used for buying
+    klines_to_load: int = 0  # candles loaded per evaluation (0 = auto from indicators)
+    buy_order_type: str = "market"  # "market" | "limit"
+    buy_price_multiple: float = 1.001  # limit price = price * multiple (>= 1: fills reliably)
+
+    # ---- Selling ------------------------------------------------------------------
     take_profit_pct: float | None = 5.0
     stop_loss_pct: float | None = 3.0
     trailing_stop_pct: float | None = None  # % below highest price since entry
-    max_open_positions: int = 5  # across all symbols run by one bot
+    trailing_activation_pct: float | None = None  # trailing stop active only after +x %
+    breakeven_trigger_pct: float | None = None  # move stop to entry price after +x %
+    min_profit_pct: float = 0.0  # signal exits only if net profit >= x % (stops always apply)
+    min_profit_abs: float = 0.0  # signal exits only if net profit >= amount
     max_holding_bars: int | None = None
-    fee_pct: float = 0.1  # per side, used for backtest/paper simulation
-    slippage_pct: float = 0.05  # per side, used for backtest/paper simulation
+    sell_order_type: str = "market"  # "market" | "limit"
+    sell_price_multiple: float = 0.999  # limit price = price * multiple (<= 1: fills reliably)
+
+    # ---- Costs (simulation: backtest & TEST mode) ----------------------------------
+    fee_pct: float = 0.1  # per side
+    slippage_pct: float = 0.05  # per side
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "RiskSettings":
-        return cls(**(d or {}))
+        known = set(cls.__dataclass_fields__)
+        return cls(**{k: v for k, v in (d or {}).items() if k in known})
 
 
 @dataclass
