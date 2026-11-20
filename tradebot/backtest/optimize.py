@@ -22,7 +22,7 @@ from tradebot.strategy.models import Strategy
 RESULT_METRICS = [
     "total_return_pct", "cagr_pct", "max_drawdown_pct", "sharpe", "sortino", "calmar",
     "num_trades", "win_rate_pct", "profit_factor", "avg_trade_pct", "exposure_pct",
-    "final_equity", "buy_hold_return_pct",
+    "final_equity", "buy_hold_return_pct", "open_at_end",
 ]
 # metrics where smaller is better
 LOWER_IS_BETTER = {"max_drawdown_pct", "max_drawdown_duration_bars", "total_fees"}

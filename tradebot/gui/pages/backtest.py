@@ -54,7 +54,7 @@ KPI_HELP = {
     "max_drawdown_pct": "Größter zwischenzeitlicher Verlust vom bisherigen Höchststand des Kapitals.",
     "win_rate_pct": "Anteil der Trades mit Gewinn.",
     "profit_factor": "Summe der Gewinne geteilt durch Summe der Verluste. Über 1 = profitabel, ab 1,5 gut.",
-    "num_trades": "Abgeschlossene Trades. Unter 20 Trades ist das Ergebnis statistisch wenig aussagekräftig.",
+    "num_trades": "Abgeschlossene Trades (ohne Positionen, die am Ende noch offen sind). Unter 20 Trades ist das Ergebnis statistisch wenig aussagekräftig.",
     "sharpe": "Rendite im Verhältnis zur Schwankung (annualisiert). Über 1 gut, über 2 sehr gut.",
 }
 
@@ -552,6 +552,11 @@ def page(strategy: str | None = None, symbol: str | None = None, broker: str | N
                             ui.label(f"Einfach kaufen und halten (Buy & Hold) hätte {fmt_pct(bh, 1)} gebracht – "
                                      f"die Strategie war damit {fmt_de(abs(round(diff, 1)))} Prozentpunkte "
                                      f"{better}.").classes("text-sm")
+                        if m.get("open_at_end"):
+                            up = m.get("open_pnl_end") or 0.0
+                            ui.label(f"Davon realisiert (abgeschlossene Trades): {fmt_money(m.get('realized_pnl'), csym, 0)} · "
+                                     f"noch offene Position am Ende: {fmt_money(up, csym, 0)} "
+                                     f"(Buchwert zum Schlusskurs, nicht verkauft)").classes("text-sm")
                         n_bars = len(res.equity)
                         ui.label(f"{form['symbol']} · {TIMEFRAME_LABELS.get(s.timeframe, s.timeframe)} · "
                                  f"{fmt_dt(res.equity.index[0])} – {fmt_dt(res.equity.index[-1])} · "
@@ -577,8 +582,9 @@ def page(strategy: str | None = None, symbol: str | None = None, broker: str | N
                         elif k == "num_trades":
                             sub = f"Ø {fmt_num(m.get('avg_bars_held'), 1)} Kerzen gehalten" if m.get("num_trades") else ""
                         elif k == "win_rate_pct" and m.get("num_trades"):
-                            wins = sum(1 for t in res.trades if t.pnl > 0)
-                            sub = f"{wins} von {len(res.trades)} Trades"
+                            closed = [t for t in res.trades if t.exit_reason.value != "end_of_data"]
+                            wins = sum(1 for t in closed if t.pnl > 0)
+                            sub = f"{wins} von {len(closed)} abgeschlossenen Trades"
                         ui.label(sub).classes("tb-muted text-xs")
 
             # warnings / skipped
@@ -661,13 +667,15 @@ def page(strategy: str | None = None, symbol: str | None = None, broker: str | N
                     "nr": i + 1,
                     "entry": pd.Timestamp(t.entry_time).timestamp(), "entry_s": fmt_dt(t.entry_time),
                     "entry_price": t.entry_price, "entry_price_s": fmt_price(t.entry_price),
-                    "exit": pd.Timestamp(t.exit_time).timestamp(), "exit_s": fmt_dt(t.exit_time),
+                    "exit": pd.Timestamp(t.exit_time).timestamp(),
                     "exit_price": t.exit_price, "exit_price_s": fmt_price(t.exit_price),
                     "qty": t.quantity, "qty_s": fmt_num(t.quantity, 6 if t.quantity < 1 else 4),
                     "pnl": t.pnl, "pnl_s": fmt_money(t.pnl, csym),
                     "pnl_pct": t.pnl_pct, "pnl_pct_s": fmt_pct(t.pnl_pct),
-                    "reason": EXIT_REASON_LABELS.get(t.exit_reason.value, t.exit_reason.value),
-                    "held": held or 0, "held_s": dur,
+                    "reason": ("Noch offen – zum Schlusskurs bewertet" if t.exit_reason.value == "end_of_data"
+                               else EXIT_REASON_LABELS.get(t.exit_reason.value, t.exit_reason.value)),
+                    "exit_s": ("– (offen)" if t.exit_reason.value == "end_of_data" else fmt_dt(t.exit_time)),
+                    "held": held or 0, "held_s": dur + (" (offen)" if t.exit_reason.value == "end_of_data" else ""),
                 })
             cols = [
                 {"name": "nr", "label": "#", "field": "nr", "sortable": True, "align": "left"},
