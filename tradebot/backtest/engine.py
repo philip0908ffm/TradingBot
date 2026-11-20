@@ -151,6 +151,10 @@ def _skip_reason(equity: float, cash: float, invested: float, r) -> tuple[str, s
     return "min_order_value", f"Kaufbetrag unter dem Mindest-Kaufbetrag ({r.min_order_value:g})"
 
 
+def _de_num(v: float) -> str:
+    return f"{v:+,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
 def run_backtest(
     strategy: Strategy,
     df: pd.DataFrame,
@@ -319,9 +323,21 @@ def run_backtest(
     if b >= n:
         warnings.append("Die Indikatoren haben in diesem Zeitraum nie gültige Werte geliefert – "
                         "es konnte nicht gehandelt werden.")
+    open_end = [t for t in trades if t.exit_reason == ExitReason.END_OF_DATA]
+    if open_end:
+        pnl_open = sum(t.pnl for t in open_end)
+        word = "Verlust" if pnl_open < 0 else "Gewinn"
+        n_open = len(open_end)
+        warnings.append(
+            f"Am Ende des Zeitraums {'war noch 1 Position' if n_open == 1 else f'waren noch {n_open} Positionen'} "
+            f"offen (unrealisierter {word} {_de_num(pnl_open)}). Sie {'ist' if n_open == 1 else 'sind'} zum letzten "
+            f"Kurs bewertet und in der Gesamtrendite enthalten – der Buchverlust bzw. -gewinn ist real, nur "
+            f"noch nicht realisiert. Trefferquote, Profit-Faktor und die übrige Trade-Statistik zählen nur "
+            f"abgeschlossene Trades."
+        )
     if not trades:
         warnings.append("Es wurde kein einziger Trade ausgeführt.")
-    elif len(trades) < MIN_TRADES_MEANINGFUL:
+    elif len(trades) - len(open_end) < MIN_TRADES_MEANINGFUL:
         warnings.append(
             f"Nur {len(trades)} Trade{'s' if len(trades) != 1 else ''} – das Ergebnis ist "
             f"statistisch kaum aussagekräftig (empfohlen: mindestens {MIN_TRADES_MEANINGFUL})."

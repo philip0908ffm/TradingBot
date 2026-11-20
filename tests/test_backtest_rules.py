@@ -303,5 +303,5 @@ def test_optimize_new_risk_paths():
                                  "entry.min_true_pct": [50]})
     assert len(out) == 4 and out["error"].isna().all()
     trades = {(r["risk.max_positions_per_symbol"], r["risk.add_position_min_drop_pct"]):
-              r["num_trades"] for _, r in out.iterrows()}
+              r["num_trades"] + r["open_at_end"] for _, r in out.iterrows()}  # positions opened
     assert trades == {(1, 5): 1, (1, 50): 1, (3, 5): 3, (3, 50): 1}

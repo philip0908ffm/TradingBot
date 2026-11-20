@@ -20,7 +20,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from tradebot.core.models import TIMEFRAMES, ClosedTrade
+from tradebot.core.models import TIMEFRAMES, ClosedTrade, ExitReason
 
 SECONDS_PER_YEAR = 365.25 * 86400
 
@@ -36,7 +36,7 @@ METRIC_LABELS: dict[str, tuple[str, str]] = {
     "sharpe": ("Sharpe Ratio", "num"),
     "sortino": ("Sortino Ratio", "num"),
     "calmar": ("Calmar Ratio", "num"),
-    "num_trades": ("Anzahl Trades", "int"),
+    "num_trades": ("Anzahl Trades (abgeschlossen)", "int"),
     "win_rate_pct": ("Trefferquote", "pct"),
     "profit_factor": ("Profit-Faktor", "num"),
     "avg_trade_pct": ("Ø Trade", "pct"),
@@ -48,6 +48,9 @@ METRIC_LABELS: dict[str, tuple[str, str]] = {
     "exposure_pct": ("Zeit im Markt", "pct"),
     "total_fees": ("Gebühren gesamt", "money"),
     "expectancy": ("Erwartungswert je Trade", "money"),
+    "realized_pnl": ("Realisierter G/V (abgeschlossene Trades)", "money"),
+    "open_at_end": ("Offene Positionen am Ende", "int"),
+    "open_pnl_end": ("Unrealisierter G/V am Ende", "money"),
 }
 
 
@@ -165,6 +168,17 @@ def compute_metrics(
     m["sortino"] = sortino
     m["calmar"] = cagr / max_dd if cagr is not None and max_dd > 1e-12 else None
 
+    # Positions still open when the data ends are valued at the last close (they are part of
+    # the equity / total return), but they are not finished trades: keep them out of the
+    # trade statistics and report them separately.
+    open_end = [t for t in trades if t.exit_reason == ExitReason.END_OF_DATA]
+    if bars_held is not None and len(bars_held) == len(trades):
+        bars_held = [b for b, t in zip(bars_held, trades) if t.exit_reason != ExitReason.END_OF_DATA]
+    trades = [t for t in trades if t.exit_reason != ExitReason.END_OF_DATA]
+    m["open_at_end"] = len(open_end)
+    m["open_pnl_end"] = float(sum(t.pnl for t in open_end))
+    m["realized_pnl"] = float(sum(t.pnl for t in trades))
+
     n = len(trades)
     m["num_trades"] = n
     pcts = np.array([t.pnl_pct for t in trades], dtype=float)
@@ -189,7 +203,7 @@ def compute_metrics(
         m["exposure_pct"] = min(sum(bars_held) / len(equity) * 100, 100.0) if n else 0.0
     else:
         m["exposure_pct"] = 0.0
-    m["total_fees"] = float(sum(t.fees for t in trades))
+    m["total_fees"] = float(sum(t.fees for t in trades) + sum(t.fees for t in open_end))
     m["expectancy"] = float(pnls.mean()) if n else None
 
     return {k: _clean(m.get(k)) for k in METRIC_LABELS}

@@ -439,3 +439,22 @@ def test_optimize_split_oos():
     assert best["oos_total_return_pct"] == pytest.approx(oos.metrics["total_return_pct"])
     assert oos.equity.index[0] == df.index[420]
     assert all(t.entry_time >= df.index[421] for t in oos.trades)
+
+
+def test_open_position_at_end_is_valued_but_not_a_closed_trade():
+    """A position still open at the end counts in the total return (marked at the last close)
+    but is kept out of the trade statistics and reported separately."""
+    from tradebot.backtest.metrics import compute_metrics
+    from tradebot.core.models import ClosedTrade, ExitReason
+    import pandas as pd
+    from datetime import datetime, timezone
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    idx = pd.date_range(t0, periods=3, freq="D", tz="UTC")
+    win = ClosedTrade("X", 1, 100, 110, idx[0], idx[1], 0.0, ExitReason.TAKE_PROFIT)
+    open_end = ClosedTrade("X", 1, 110, 50, idx[1], idx[2], 0.0, ExitReason.END_OF_DATA)
+    eq = pd.Series([1000, 1010, 950], index=idx, dtype=float)
+    m = compute_metrics(eq, [win, open_end], None, "1d", 1000)
+    assert m["num_trades"] == 1 and m["win_rate_pct"] == 100
+    assert m["open_at_end"] == 1 and m["open_pnl_end"] == -60
+    assert m["realized_pnl"] == 10
+    assert m["total_return_pct"] == pytest.approx(-5)  # the open loss is still part of the result
